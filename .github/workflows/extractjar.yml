@@ -13,7 +13,7 @@ jobs:
       - name: Extract JAR
         run: |
           mkdir -p extracted
-          unzip your-file.jar -d extracted/
+          unzip hellomule.jar -d extracted/
 
       - name: Commit extracted files
         run: |
