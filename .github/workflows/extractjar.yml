@@ -1,0 +1,25 @@
+name: Extract JAR
+
+on:
+  workflow_dispatch:  # run manually from GitHub UI
+permissions:
+  contents: write
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Extract JAR
+        run: |
+          mkdir -p extracted
+          unzip hellomule.jar -d extracted/
+
+      - name: Commit extracted files
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add extracted/
+          git commit -m "chore: extracted jar contents"
+          git push

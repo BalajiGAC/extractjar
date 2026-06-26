@@ -1,0 +1,415 @@
+name: Extract JAR and Generate Flow Documentation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Extract JAR
+        run: |
+          mkdir -p extracted
+          unzip -o hellomule.jar -d extracted/
+
+      - name: List XML Files
+        run: |
+          echo "Found XML files:"
+          find extracted -name "*.xml" | sort
+
+      - name: Install Python dependencies
+        run: pip install python-docx
+
+      - name: Generate Word Documentation
+        run: |
+          python3 << 'EOF'
+          from docx import Document
+          from docx.shared import Pt, RGBColor, Inches
+          from docx.enum.text import WD_ALIGN_PARAGRAPH
+          from docx.oxml.ns import qn
+          from docx.oxml import OxmlElement
+          import xml.etree.ElementTree as ET
+          import os
+
+          # ── Namespace map ─────────────────────────────────────────
+          NS = {
+              'mule': 'http://www.mulesoft.org/schema/mule/core',
+              'http': 'http://www.mulesoft.org/schema/mule/http',
+              'db':   'http://www.mulesoft.org/schema/mule/db',
+              'ee':   'http://www.mulesoft.org/schema/mule/ee/core',
+              'os':   'http://www.mulesoft.org/schema/mule/os',
+              'file': 'http://www.mulesoft.org/schema/mule/file',
+              'salesforce': 'http://www.mulesoft.org/schema/mule/salesforce',
+          }
+
+          REAL_CONNECTORS = {'http', 'db', 'os', 'file', 'salesforce'}
+          NOISE_TAGS = {
+              'bulk-input-parameters', 'sql', 'input-parameters', 'default-value',
+              'value', 'query-params', 'response-validator', 'success-status-code-validator',
+              'request-connection', 'listener-connection', 'scheduling-strategy',
+              'fixed-frequency', 'set-payload', 'message', 'variables', 'set-variable'
+          }
+
+          HUMAN_DESCRIPTIONS = {
+              'listener':      lambda a: f"HTTP Listener — waits for incoming requests on path '{a.get('path','?')}' [{a.get('allowedMethods','ANY')}]",
+              'request':       lambda a: f"HTTP Request — calls external URL '{a.get('url','?')}' using {a.get('method','GET')}",
+              'bulk-insert':   lambda a:  "Database Bulk Insert — inserts multiple records into the database",
+              'select':        lambda a:  "Database Select — queries records from the database",
+              'retrieve':      lambda a: f"Object Store Retrieve — reads '{a.get('key','?')}' into variable '{a.get('target','?')}'",
+              'store':         lambda a: f"Object Store Store — saves updated value for key '{a.get('key','?')}'",
+              'scheduler':     lambda a:  "Scheduler — triggers the flow automatically on a schedule",
+              'logger':        lambda a: f"Logger — logs: {str(a.get('message',''))[:60]}{'...' if len(str(a.get('message','')))>60 else ''}",
+              'set-payload':   lambda a:  "Set Payload — sets the response message payload",
+              'set-variable':  lambda a: f"Set Variable — stores a value in variable '{a.get('variableName','?')}'",
+              'transform':     lambda a:  "DataWeave Transform — transforms the message payload or variables",
+              'scatter-gather':lambda a:  "Scatter-Gather — runs multiple routes in parallel and merges all results",
+              'choice':        lambda a:  "Choice Router — routes the message based on a conditional expression",
+              'try':           lambda a:  "Try Scope — wraps steps with isolated error handling",
+              'flow-ref':      lambda a: f"Flow Reference — calls sub-flow '{a.get('name','?')}'",
+              'error-handler': lambda a:  "Error Handler — catches and handles errors in this scope",
+          }
+
+          # ── Helpers ───────────────────────────────────────────────
+          def get_tag(el):
+              return el.tag.split('}')[-1] if '}' in el.tag else el.tag
+
+          def get_ns_uri(el):
+              return el.tag.split('}')[0].strip('{') if '}' in el.tag else ''
+
+          def get_prefix(el):
+              ns_map = {v: k for k, v in NS.items()}
+              return ns_map.get(get_ns_uri(el), 'mule')
+
+          def human_step(el):
+              tag = get_tag(el)
+              prefix = get_prefix(el)
+              fn = HUMAN_DESCRIPTIONS.get(tag)
+              if fn:
+                  return fn(el.attrib)
+              return f"{prefix}:{tag}"
+
+          def shade_cell(cell, hex_color):
+              tc = cell._tc
+              tcPr = tc.get_or_add_tcPr()
+              shd = OxmlElement('w:shd')
+              shd.set(qn('w:val'), 'clear')
+              shd.set(qn('w:color'), 'auto')
+              shd.set(qn('w:fill'), hex_color)
+              tcPr.append(shd)
+
+          def add_kv(doc, key, value):
+              p = doc.add_paragraph()
+              p.paragraph_format.space_after = Pt(2)
+              r1 = p.add_run(f"{key}: ")
+              r1.bold = True
+              r1.font.color.rgb = RGBColor(0x1F, 0x49, 0x7D)
+              p.add_run(str(value) if value else "N/A")
+
+          def add_divider(doc):
+              p = doc.add_paragraph()
+              p.paragraph_format.space_before = Pt(4)
+              p.paragraph_format.space_after = Pt(4)
+              pPr = p._p.get_or_add_pPr()
+              pBdr = OxmlElement('w:pBdr')
+              bottom = OxmlElement('w:bottom')
+              bottom.set(qn('w:val'), 'single')
+              bottom.set(qn('w:sz'), '6')
+              bottom.set(qn('w:space'), '1')
+              bottom.set(qn('w:color'), '2E75B6')
+              pBdr.append(bottom)
+              pPr.append(pBdr)
+
+          def add_code_block(doc, code):
+              p = doc.add_paragraph()
+              p.paragraph_format.left_indent = Inches(0.3)
+              p.paragraph_format.space_before = Pt(2)
+              p.paragraph_format.space_after = Pt(6)
+              run = p.add_run(code.strip())
+              run.font.name = 'Courier New'
+              run.font.size = Pt(9)
+              run.font.color.rgb = RGBColor(0x1A, 0x1A, 0x1A)
+
+          def add_table(doc, headers, rows, col_widths):
+              table = doc.add_table(rows=1, cols=len(headers))
+              table.style = 'Table Grid'
+              hdr_cells = table.rows[0].cells
+              for i, h in enumerate(headers):
+                  hdr_cells[i].width = Inches(col_widths[i])
+                  shade_cell(hdr_cells[i], '2E75B6')
+                  p = hdr_cells[i].paragraphs[0]
+                  run = p.add_run(h)
+                  run.bold = True
+                  run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+                  run.font.size = Pt(10)
+              for ri, row_data in enumerate(rows):
+                  row_cells = table.add_row().cells
+                  fill = 'EBF3FB' if ri % 2 == 0 else 'FFFFFF'
+                  for i, cell_text in enumerate(row_data):
+                      row_cells[i].width = Inches(col_widths[i])
+                      shade_cell(row_cells[i], fill)
+                      p = row_cells[i].paragraphs[0]
+                      p.add_run(str(cell_text)).font.size = Pt(9)
+              return table
+
+          # ── Trigger description ───────────────────────────────────
+          def get_trigger_description(flow_el):
+              children = list(flow_el)
+              if not children:
+                  return "No trigger defined"
+              trigger = children[0]
+              tag = get_tag(trigger)
+              prefix = get_prefix(trigger)
+              attrs = trigger.attrib
+
+              if tag == 'listener' and prefix == 'http':
+                  method = attrs.get('allowedMethods', 'ANY')
+                  path = attrs.get('path', '?')
+                  return f"HTTP Listener — receives {method} requests at path '{path}'"
+
+              elif tag == 'listener' and prefix == 'file':
+                  directory = attrs.get('directory', '?')
+                  mode = attrs.get('watermarkMode', 'N/A')
+                  for s in trigger.iter():
+                      if get_tag(s) == 'fixed-frequency':
+                          freq = s.attrib.get('frequency', '?')
+                          unit = s.attrib.get('timeUnit', '?')
+                          return f"File Listener — polls '{directory}' every {freq} {unit}, watermark: {mode}"
+                  return f"File Listener — polls '{directory}', watermark: {mode}"
+
+              elif tag == 'scheduler':
+                  for s in trigger.iter():
+                      if get_tag(s) == 'fixed-frequency':
+                          freq = s.attrib.get('frequency', '?')
+                          unit = s.attrib.get('timeUnit', '?')
+                          return f"Scheduler — fires every {freq} {unit} automatically"
+                  return "Scheduler — fires on a time-based schedule"
+
+              elif tag == 'logger':
+                  return "No trigger — orphan flow (starts with a Logger, likely debug/utility only)"
+
+              return f"{prefix}:{tag}"
+
+          # ── Human overview per flow ───────────────────────────────
+          def get_flow_overview(flow_name, trigger_desc, step_count):
+              name = flow_name.lower()
+              if name == 'hellomuleflow':
+                  return "A simple GET endpoint that returns a hardcoded 'Hello Mule' JSON response and logs secure property values (username/password) from the secure properties store."
+              if name == 'hellomuleflow1':
+                  return "Fetches all employee records from the database and returns them as a JSON array with each employee's name split into separate firstname and lastname fields."
+              if name == 'hellomuleflow2':
+                  return "Monitors a local folder for new or updated files using a watermark timestamp. Every 60 seconds it picks up new files and moves them to an output directory."
+              if name == 'connectdatabaseflow':
+                  return "Accepts a JSON array of employees via HTTP POST, performs a bulk insert into the employee database table, then queries and returns a specific employee by ID."
+              if name == 'connectdatabaseflow1':
+                  return "A scheduled polling flow that runs every minute. It retrieves the last-run watermark from the Object Store, queries only new employee records created since then, and updates the watermark with the latest timestamp found."
+              if name == 'connectdatabaseflow2':
+                  return "A utility/debug flow with no trigger. It simply logs the current watermark variable value at INFO level. This flow cannot be invoked automatically."
+              if name == 'scattermuleflow':
+                  return "Demonstrates parallel processing using Scatter-Gather. It sets a message variable, fans out to 3 concurrent routes each running an independent DataWeave transform, then merges all results and returns them as a single JSON response."
+              if name == 'testinghtmlflow':
+                  return "Calls the CricAPI external REST API to fetch live cricket match data. Based on the HTTP response status, it either maps the match list into a structured JSON response or returns an error message."
+              return f"This flow contains {step_count} processing steps. Triggered by: {trigger_desc}"
+
+          # ── Parse and document one flow ───────────────────────────
+          def parse_flow(doc, flow_el, filename):
+              flow_name = flow_el.attrib.get('name', 'Unnamed Flow')
+              flow_type = get_tag(flow_el)
+              children = list(flow_el)
+
+              doc.add_heading(f"Flow: {flow_name}", level=2)
+              add_kv(doc, "Source File", filename)
+              add_kv(doc, "Flow Type", flow_type.replace('-', ' ').title())
+
+              # Overview
+              trigger_desc = get_trigger_description(flow_el)
+              overview = get_flow_overview(flow_name, trigger_desc, len(children))
+              doc.add_heading("Overview", level=3)
+              p = doc.add_paragraph(overview)
+              p.paragraph_format.space_after = Pt(8)
+
+              # Trigger
+              doc.add_heading("Trigger", level=3)
+              add_kv(doc, "Description", trigger_desc)
+              if children:
+                  cfg = children[0].attrib.get('config-ref')
+                  if cfg:
+                      add_kv(doc, "Config Reference", cfg)
+
+              # Logic Steps — plain English, skip noise
+              doc.add_heading("Logic Steps", level=3)
+              step_rows = []
+              step_num = 1
+              for child in children:
+                  tag = get_tag(child)
+                  if tag in NOISE_TAGS:
+                      continue
+                  desc = human_step(child)
+                  step_rows.append([str(step_num), desc])
+                  step_num += 1
+
+              if step_rows:
+                  add_table(doc, ['Step', 'What it does'], step_rows, [0.5, 5.5])
+              doc.add_paragraph()
+
+              # DataWeave — deduplicated, only from ee:set-payload
+              dw_scripts = []
+              seen_scripts = set()
+              for el in flow_el.iter('{http://www.mulesoft.org/schema/mule/ee/core}set-payload'):
+                  script = el.text.strip() if el.text else ''
+                  if script and script not in seen_scripts:
+                      seen_scripts.add(script)
+                      dw_scripts.append(script)
+
+              if dw_scripts:
+                  doc.add_heading("DataWeave Transformations", level=3)
+                  for idx, script in enumerate(dw_scripts, 1):
+                      if 'Error' in script:
+                          purpose = "Returns an error response payload"
+                      elif 'map' in script and 'splitBy' in script:
+                          purpose = "Maps DB records and splits Name into firstname/lastname"
+                      elif 'map' in script and 'MatchName' in script:
+                          purpose = "Maps API response to structured match list"
+                      elif 'map' in script:
+                          purpose = "Maps and transforms payload array to a new structure"
+                      elif 'vars.message' in script:
+                          purpose = "Builds message string from flow variable"
+                      elif 'application/json' in script and script.strip().endswith('payload'):
+                          purpose = "Passes payload through as JSON output"
+                      elif 'application/java' in script:
+                          purpose = "Transforms payload to a Java object"
+                      else:
+                          purpose = "DataWeave transformation"
+
+                      p = doc.add_paragraph()
+                      r = p.add_run(f"Transform {idx} — {purpose}")
+                      r.bold = True
+                      r.font.color.rgb = RGBColor(0x1F, 0x49, 0x7D)
+                      add_code_block(doc, script)
+
+              # Error Handling
+              for el in flow_el.iter():
+                  if get_tag(el) == 'error-handler':
+                      doc.add_heading("Error Handling", level=3)
+                      for handler in list(el):
+                          strategy = get_tag(handler)
+                          error_type = handler.attrib.get('type', 'ANY')
+                          notify = handler.attrib.get('enableNotifications', 'true')
+                          add_kv(doc, "Strategy", strategy)
+                          add_kv(doc, "Catches Error Types", error_type)
+                          add_kv(doc, "Enable Notifications", notify)
+                          if strategy == 'on-error-continue':
+                              doc.add_paragraph(
+                                  "Behaviour: Logs the error and continues processing. "
+                                  "The parent scope (e.g. Scatter-Gather route) does not fail."
+                              )
+                          else:
+                              doc.add_paragraph(
+                                  "Behaviour: Propagates the error up to the calling flow "
+                                  "or the application default error handler."
+                              )
+
+              # Connectors — real connectors only, no noise
+              connector_rows = []
+              seen_connectors = set()
+              for el in flow_el.iter():
+                  prefix = get_prefix(el)
+                  tag = get_tag(el)
+                  if prefix in REAL_CONNECTORS and tag not in NOISE_TAGS:
+                      key = f"{prefix}:{tag}"
+                      if key not in seen_connectors:
+                          seen_connectors.add(key)
+                          config = el.attrib.get('config-ref', '-')
+                          connector_rows.append([key, config])
+
+              if connector_rows:
+                  doc.add_heading("Connectors Used", level=3)
+                  add_table(doc, ['Connector', 'Config Reference'], connector_rows, [2.5, 3.5])
+                  doc.add_paragraph()
+
+              add_divider(doc)
+              doc.add_paragraph()
+
+          # ── Main ──────────────────────────────────────────────────
+          doc = Document()
+
+          # Cover page
+          title_para = doc.add_paragraph()
+          title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+          title_run = title_para.add_run("MuleSoft Flow Documentation")
+          title_run.bold = True
+          title_run.font.size = Pt(28)
+          title_run.font.color.rgb = RGBColor(0x1F, 0x49, 0x7D)
+
+          doc.add_paragraph()
+
+          sub_para = doc.add_paragraph()
+          sub_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+          sub_run = sub_para.add_run("Auto-generated from extracted JAR contents")
+          sub_run.font.size = Pt(13)
+          sub_run.font.color.rgb = RGBColor(0x44, 0x72, 0xC4)
+
+          doc.add_page_break()
+
+          # Find XML files — deduplicated by filename, skip junk dirs
+          SKIP_DIRS = {
+              '.mule', '.settings', 'cache', 'offheap-disk-store',
+              'test', 'munit', 'java', 'resources', 'api'
+          }
+          xml_files = []
+          seen_filenames = set()
+
+          for search_root in ['extracted/META-INF/mule-src', 'extracted']:
+              if not os.path.exists(search_root):
+                  continue
+              for root, dirs, files in os.walk(search_root):
+                  dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+                  for f in files:
+                      if f.endswith('.xml') and f not in seen_filenames:
+                          seen_filenames.add(f)
+                          xml_files.append(os.path.join(root, f))
+
+          print(f"Processing {len(xml_files)} unique XML file(s):")
+          for xf in xml_files:
+              print(f"  {xf}")
+
+          if not xml_files:
+              doc.add_paragraph("No XML flow files found in extracted contents.")
+          else:
+              for xml_path in xml_files:
+                  try:
+                      tree = ET.parse(xml_path)
+                      root_el = tree.getroot()
+                      flows = (
+                          root_el.findall('{http://www.mulesoft.org/schema/mule/core}flow') +
+                          root_el.findall('{http://www.mulesoft.org/schema/mule/core}sub-flow')
+                      )
+                      if not flows:
+                          print(f"  No flows in {xml_path} — skipping")
+                          continue
+
+                      doc.add_heading(f"File: {os.path.basename(xml_path)}", level=1)
+
+                      for flow in flows:
+                          parse_flow(doc, flow, os.path.basename(xml_path))
+                          doc.add_page_break()
+
+                  except ET.ParseError as e:
+                      print(f"  Parse error in {xml_path}: {e}")
+
+          doc.save('MuleSoft-Flow-Documentation.docx')
+          print("Done — MuleSoft-Flow-Documentation.docx saved successfully.")
+          EOF
+
+      - name: Commit files
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add extracted/ MuleSoft-Flow-Documentation.docx
+          git commit -m "docs: generated human-readable MuleSoft flow documentation"
+          git push
