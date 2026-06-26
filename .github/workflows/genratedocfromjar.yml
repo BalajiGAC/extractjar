@@ -16,7 +16,7 @@ jobs:
       - name: Extract JAR
         run: |
           mkdir -p extracted
-          unzip -o hellomule.jar -d extracted/
+          unzip -o subflowsprivateflows.jar -d extracted/
 
       - name: List XML Files
         run: |
