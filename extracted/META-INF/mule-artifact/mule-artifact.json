@@ -1,17 +1,10 @@
 {
   "configs": [
-    "scattermule.xml",
-    "hellomule.xml",
-    "balajitestmule.xml",
-    "connectdatabase.xml",
-    "testinghtml.xml",
-    "globalxml.xml"
+    "subflowsprivateflows.xml"
   ],
-  "secureProperties": [
-    "secure.key"
-  ],
+  "secureProperties": [],
   "redeploymentEnabled": true,
-  "name": "com.mycompany:hellomule:1.0.0",
+  "name": "com.mycompany:subflowsprivateflows:1.0.0-SNAPSHOT",
   "minMuleVersion": "4.4.0",
   "requiredProduct": "MULE_EE",
   "classLoaderModelLoaderDescriptor": {
@@ -20,19 +13,9 @@
       "exportedPackages": [],
       "exportedResources": [
         "application-types.xml",
-        "balajitestmule.xml",
-        "commondb.yaml",
-        "connectdatabase.xml",
-        "dev-secure-properties.yaml",
-        "dev.properties",
-        "dev.secure.properties",
-        "globalxml.xml",
-        "hellomule.xml",
-        "local.properties",
-        "local.secure.properties",
+        "config.properties",
         "log4j2.xml",
-        "scattermule.xml",
-        "testinghtml.xml"
+        "subflowsprivateflows.xml"
       ]
     }
   },
