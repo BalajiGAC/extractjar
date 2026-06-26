@@ -94,7 +94,6 @@ jobs:
           MULE_CORE_NS = 'http://www.mulesoft.org/schema/mule/core'
           EE_NS        = 'http://www.mulesoft.org/schema/mule/ee/core'
 
-          # Sub-config elements that are NOT logic steps
           NOISE_TAGS = {
               'bulk-input-parameters','sql','input-parameters','default-value',
               'value','query-params','response-validator','success-status-code-validator',
@@ -105,7 +104,6 @@ jobs:
               'reconnection','expiration-policy','redelivery-policy',
           }
 
-          # XML files that are definitely not Mule flows
           NON_MULE_FILENAMES = {
               'pom.xml','log4j2.xml','log4j.xml','application-types.xml',
               'beans.xml','web.xml','context.xml','persistence.xml',
@@ -115,6 +113,39 @@ jobs:
               '.mule','.settings','cache','offheap-disk-store',
               'test','munit','java','api','wsdl','xsd','repository',
           }
+
+          # ─────────────────────────────────────────────────────────────
+          # COLOR CONSTANTS
+          # ─────────────────────────────────────────────────────────────
+          BLUE_DARK  = RGBColor(0x1F, 0x49, 0x7D)
+          BLUE_MID   = RGBColor(0x2E, 0x75, 0xB6)
+          BLUE_LIGHT = RGBColor(0x44, 0x72, 0xC4)
+          WHITE      = RGBColor(0xFF, 0xFF, 0xFF)
+          GREY       = RGBColor(0x44, 0x44, 0x44)
+          GREEN_DARK = RGBColor(0x1E, 0x6B, 0x3A)
+          BLACK      = RGBColor(0x00, 0x00, 0x00)
+          CODE_FG    = RGBColor(0x1A, 0x1A, 0x1A)
+          ERR_RED    = RGBColor(0xC0, 0x30, 0x30)
+          CODE_BG    = 'F2F2F2'
+
+          # ─────────────────────────────────────────────────────────────
+          # SAFE COLOR SETTER  ← fixes the AttributeError
+          # python-docx's font.color returns a ColorFormat object whose
+          # .rgb property setter is not always available depending on the
+          # internal state.  Setting via XML is version-proof.
+          # ─────────────────────────────────────────────────────────────
+          def set_font_color(run, rgb_color):
+              """Set run font color safely via XML (avoids 'no setter' error)."""
+              rPr = run._r.get_or_add_rPr()
+              # Remove any existing <w:color> element
+              for old in rPr.findall(qn('w:color')):
+                  rPr.remove(old)
+              color_el = OxmlElement('w:color')
+              hex_val  = '{:02X}{:02X}{:02X}'.format(
+                  rgb_color[0], rgb_color[1], rgb_color[2]
+              )
+              color_el.set(qn('w:val'), hex_val)
+              rPr.append(color_el)
 
           # ─────────────────────────────────────────────────────────────
           # HELPERS
@@ -136,7 +167,6 @@ jobs:
               return 'mule'
 
           def is_mule_file(path):
-              """Return True only if file is a MuleSoft flow XML."""
               fname = os.path.basename(path)
               if fname in NON_MULE_FILENAMES:
                   return False
@@ -144,7 +174,6 @@ jobs:
                   tree = ET.parse(path)
                   root = tree.getroot()
                   ns   = get_ns_uri(root)
-                  # Must have mule core namespace in root
                   return MULE_CORE_NS in ns or 'mulesoft.org/schema/mule' in ns
               except:
                   return False
@@ -159,7 +188,7 @@ jobs:
               return text[:55] + ('...' if len(text) > 55 else '')
 
           # ─────────────────────────────────────────────────────────────
-          # STEP DESCRIPTION — for logic step table AND mermaid node label
+          # STEP DESCRIPTION
           # ─────────────────────────────────────────────────────────────
           def describe_element(el):
               tag    = get_tag(el)
@@ -170,66 +199,45 @@ jobs:
                   msg = a.get('message','')
                   lvl = a.get('level','INFO')
                   return f"Logger ({lvl})", f"Logs: {msg[:60]}{'...' if len(msg)>60 else ''}"
-
               if tag == 'set-payload':
                   val = a.get('value','')
                   return "Set Payload", f"Sets payload to: {val[:60] if val else '(see DataWeave)'}"
-
               if tag == 'set-variable':
                   return "Set Variable", f"Sets vars.{a.get('variableName','?')} = {str(a.get('value',''))[:50]}"
-
               if tag in ('transform',) and prefix == 'ee':
                   return "DataWeave Transform", "Transforms message payload / variables (see DataWeave below)"
-
               if tag == 'scatter-gather':
                   return "Scatter-Gather", "Executes multiple routes in parallel and merges all results"
-
               if tag == 'choice':
                   return "Choice Router", "Routes message to different paths based on condition"
-
               if tag == 'try':
                   return "Try Scope", "Wraps steps with isolated error handling"
-
               if tag == 'error-handler':
                   return "Error Handler", "Handles errors thrown within this scope"
-
               if tag == 'on-error-propagate':
                   return "On Error Propagate", f"Propagates error (type: {a.get('type','ANY')})"
-
               if tag == 'on-error-continue':
                   return "On Error Continue", f"Swallows error and continues (type: {a.get('type','ANY')})"
-
               if tag == 'flow-ref':
                   return "Flow Reference", f"Calls sub-flow: {a.get('name','?')}"
-
               if tag == 'scheduler':
                   return "Scheduler", "Triggers flow on a time-based schedule"
-
               if tag == 'async':
                   return "Async Scope", "Executes inner processors asynchronously"
-
               if tag == 'foreach':
                   return "For Each", f"Iterates over collection: {a.get('collection','payload')}"
-
               if tag == 'parallel-foreach':
                   return "Parallel For Each", f"Iterates in parallel over: {a.get('collection','payload')}"
-
               if tag == 'until-successful':
                   return "Until Successful", f"Retries until success (max {a.get('maxRetries','?')} retries)"
-
               if tag == 'first-successful':
                   return "First Successful", "Tries routes until one succeeds"
-
               if tag == 'round-robin':
                   return "Round Robin", "Distributes messages across routes in order"
-
-              # HTTP
               if prefix == 'http' and tag == 'listener':
                   return "HTTP Listener", f"Receives {a.get('allowedMethods','ANY')} requests at '{a.get('path','?')}'"
               if prefix == 'http' and tag == 'request':
                   return "HTTP Request", f"{a.get('method','GET')} → {a.get('url', a.get('path','?'))}"
-
-              # DB
               if prefix == 'db':
                   op_map = {
                       'select':'Select — queries records',
@@ -241,8 +249,6 @@ jobs:
                       'stored-procedure':'Stored Procedure — executes DB procedure',
                   }
                   return f"DB {tag.replace('-',' ').title()}", op_map.get(tag, tag) + f" (config: {a.get('config-ref','?')})"
-
-              # Object Store
               if prefix == 'os':
                   op_map = {
                       'retrieve': f"Reads key '{a.get('key','?')}' → stores in vars.{a.get('target','?')}",
@@ -251,8 +257,6 @@ jobs:
                       'contains': f"Checks if key '{a.get('key','?')}' exists",
                   }
                   return f"Object Store {tag.title()}", op_map.get(tag, tag)
-
-              # File / FTP / SFTP
               if prefix in ('file','ftp','sftp'):
                   op_map = {
                       'listener': f"Watches '{a.get('directory','?')}' for new/updated files",
@@ -264,8 +268,6 @@ jobs:
                       'list':     f"Lists files in '{a.get('directoryPath','?')}'",
                   }
                   return f"{prefix.upper()} {tag.title()}", op_map.get(tag, tag)
-
-              # JMS / VM
               if prefix in ('jms','vm'):
                   op_map = {
                       'listener':  f"Subscribes to '{a.get('destination', a.get('queueName','?'))}'",
@@ -273,35 +275,17 @@ jobs:
                       'consume':   f"Consumes from '{a.get('destination', a.get('queueName','?'))}'",
                   }
                   return f"{prefix.upper()} {tag.title()}", op_map.get(tag, tag)
-
-              # Salesforce
               if prefix == 'salesforce':
                   return f"Salesforce {tag.replace('-',' ').title()}", f"Object type: {a.get('type', a.get('sObjectType','?'))}"
-
-              # Email
               if prefix == 'email':
                   return f"Email {tag.title()}", f"Via config: {a.get('config-ref','?')}"
-
-              # Generic fallback
               cfg = a.get('config-ref','')
               return f"{prefix}:{tag}", f"Config: {cfg}" if cfg else ''
 
           # ─────────────────────────────────────────────────────────────
-          # DATAWEAVE EXTRACTOR — per element (not global)
-          # Returns list of (context_label, script) for ONE element
+          # DATAWEAVE EXTRACTOR
           # ─────────────────────────────────────────────────────────────
           def get_dw_for_element(el):
-              """
-              Returns all DataWeave scripts that belong to this specific element.
-              Checks:
-               - ee:transform children (ee:message/ee:set-payload, ee:variables/ee:set-variable)
-               - set-payload value="#[...]"
-               - db:input-parameters / db:bulk-input-parameters text
-               - os:value / os:default-value text
-               - http:query-params / http:body text
-               - logger message="#[...]"
-               - any child with text starting %dw or #[
-              """
               scripts = []
               seen    = set()
               tag     = get_tag(el)
@@ -313,7 +297,6 @@ jobs:
                       seen.add(s)
                       scripts.append((label, s))
 
-              # ee:transform — collect payload + variable scripts
               if tag == 'transform' and prefix == 'ee':
                   for child in el.iter():
                       ctag = get_tag(child)
@@ -324,7 +307,6 @@ jobs:
                           vname = child.attrib.get('variableName','?')
                           add(f'Output — variable "{vname}"', child.text)
 
-              # set-payload inline DW
               if tag == 'set-payload':
                   val = el.attrib.get('value','')
                   if val.startswith('#['):
@@ -332,13 +314,11 @@ jobs:
                   if el.text and el.text.strip():
                       add('Body', el.text)
 
-              # logger inline DW
               if tag == 'logger':
                   msg = el.attrib.get('message','')
                   if msg.startswith('#[') and len(msg) > 5:
                       add('Inline expression', msg)
 
-              # db — collect sql + input-parameters
               if prefix == 'db':
                   for child in el:
                       ctag = get_tag(child)
@@ -347,30 +327,22 @@ jobs:
                       if ctag in ('input-parameters','bulk-input-parameters') and child.text:
                           add(f'{ctag}', child.text)
 
-              # os — collect value / default-value
               if prefix == 'os':
                   for child in el:
                       ctag = get_tag(child)
                       if ctag in ('value','default-value') and child.text:
                           add(ctag, child.text)
 
-              # http:request — collect query-params, body, headers
               if prefix == 'http' and tag == 'request':
                   for child in el.iter():
                       ctag = get_tag(child)
                       if ctag in ('query-params','body','headers') and child.text:
                           add(ctag, child.text)
 
-              # scatter-gather / choice / try / foreach — collect from nested transforms
-              # but only at the direct child level (not recursively — handled per-route)
-              if tag in ('scatter-gather','choice','try','foreach','parallel-foreach',
-                         'async','until-successful','first-successful','round-robin'):
-                  pass  # handled separately in route parsing
-
               return scripts
 
           # ─────────────────────────────────────────────────────────────
-          # MERMAID DIAGRAM — per flow, generic for any structure
+          # MERMAID DIAGRAM
           # ─────────────────────────────────────────────────────────────
           _node_id = [0]
 
@@ -407,7 +379,6 @@ jobs:
                               cond = route.attrib.get('expression','otherwise')
                               cond = clean_mermaid(cond)[:40]
                               rn   = nid()
-                              # label from first meaningful child
                               inner = [c for c in route if get_tag(c) not in NOISE_TAGS]
                               if inner:
                                   it, id_ = describe_element(inner[0])
@@ -447,12 +418,10 @@ jobs:
                           lines.append(f'    {n}[{label}]')
                           if last:
                               lines.append(f'    {last} --> {n}')
-                          # inner steps
                           inner_children = [c for c in el
                                             if get_tag(c) not in NOISE_TAGS
                                             and get_tag(c) != 'error-handler']
                           last = process_children(inner_children, n)
-                          # error branch
                           for c in el:
                               if get_tag(c) == 'error-handler':
                                   en = nid()
@@ -481,7 +450,6 @@ jobs:
                                   lines.append(f'    {last} -->|error| {en}')
                           continue
 
-                      # Generic node
                       label = clean_mermaid(f"{title}: {detail}" if detail else title)
                       lines.append(f'    {n}[{label}]')
                       if last:
@@ -499,7 +467,7 @@ jobs:
               return '\n'.join(lines)
 
           # ─────────────────────────────────────────────────────────────
-          # CONNECTOR SUMMARY — universal
+          # CONNECTOR SUMMARY
           # ─────────────────────────────────────────────────────────────
           def extract_connectors(flow_el):
               rows = []
@@ -642,14 +610,6 @@ jobs:
           # ─────────────────────────────────────────────────────────────
           # WORD DOC STYLE HELPERS
           # ─────────────────────────────────────────────────────────────
-          BLUE_DARK  = RGBColor(0x1F, 0x49, 0x7D)
-          BLUE_MID   = RGBColor(0x2E, 0x75, 0xB6)
-          BLUE_LIGHT = RGBColor(0x44, 0x72, 0xC4)
-          WHITE      = RGBColor(0xFF, 0xFF, 0xFF)
-          GREY       = RGBColor(0x44, 0x44, 0x44)
-          GREEN_DARK = RGBColor(0x1E, 0x6B, 0x3A)
-          CODE_BG    = 'F2F2F2'
-
           def shade_cell(cell, hex_color):
               tc   = cell._tc
               tcPr = tc.get_or_add_tcPr()
@@ -680,24 +640,23 @@ jobs:
                   p.paragraph_format.left_indent = Inches(0.25)
               r1 = p.add_run(f"{key}: ")
               r1.bold = True
-              r1.font.color.rgb = BLUE_DARK
-              p.add_run(safe(value)).font.color = None
+              set_font_color(r1, BLUE_DARK)
+              r2 = p.add_run(safe(value))
+              set_font_color(r2, BLACK)
 
           def add_bullet(doc, text, indent=0.25):
               p = doc.add_paragraph()
-              p.paragraph_format.left_indent  = Inches(indent)
-              p.paragraph_format.space_after  = Pt(2)
+              p.paragraph_format.left_indent = Inches(indent)
+              p.paragraph_format.space_after = Pt(2)
               p.add_run('• ' + text).font.size = Pt(10)
 
           def add_code_block(doc, code, small=False):
-              """Renders code in monospace Courier New with grey background."""
               for line in code.strip().split('\n'):
                   p   = doc.add_paragraph()
                   p.paragraph_format.left_indent  = Inches(0.25)
                   p.paragraph_format.right_indent = Inches(0.25)
                   p.paragraph_format.space_before = Pt(0)
                   p.paragraph_format.space_after  = Pt(0)
-                  # grey background via paragraph shading
                   pPr = p._p.get_or_add_pPr()
                   shd = OxmlElement('w:shd')
                   shd.set(qn('w:val'),   'clear')
@@ -707,21 +666,20 @@ jobs:
                   run = p.add_run(line if line else ' ')
                   run.font.name  = 'Courier New'
                   run.font.size  = Pt(8 if small else 9)
-                  run.font.color = None
+                  set_font_color(run, CODE_FG)
               doc.add_paragraph().paragraph_format.space_after = Pt(4)
 
           def add_mermaid_block(doc, code):
-              """Renders mermaid diagram code in a styled code block."""
               p = doc.add_paragraph()
               r = p.add_run('Flow Diagram (Mermaid)')
               r.bold = True
-              r.font.color.rgb = BLUE_MID
+              set_font_color(r, BLUE_MID)
               r.font.size = Pt(10)
               add_code_block(doc, '```mermaid\n' + code + '\n```', small=True)
 
           def add_table(doc, headers, rows, col_widths):
               if not rows:
-                  doc.add_paragraph('None').italic = True
+                  doc.add_paragraph('').add_run('None').italic = True
                   return
               tbl = doc.add_table(rows=1, cols=len(headers))
               tbl.style = 'Table Grid'
@@ -732,7 +690,7 @@ jobs:
                   p   = hdr_cells[i].paragraphs[0]
                   run = p.add_run(h)
                   run.bold = True
-                  run.font.color.rgb = WHITE
+                  set_font_color(run, WHITE)
                   run.font.size = Pt(10)
               for ri, row_data in enumerate(rows):
                   cells = tbl.add_row().cells
@@ -746,17 +704,8 @@ jobs:
 
           # ─────────────────────────────────────────────────────────────
           # LOGIC STEPS WITH INLINE DATAWEAVE
-          # This is the core new feature:
-          # For each step → show step row → then immediately show any DW
           # ─────────────────────────────────────────────────────────────
           def add_logic_steps_with_dw(doc, flow_el):
-              """
-              Renders each logic step as:
-                [Step N] Component Name — Description
-                  If DataWeave exists for this step, render it inline below.
-                  For compound steps (scatter-gather, choice, try, foreach):
-                    expand sub-routes with their own steps + DW.
-              """
               step_num = [0]
 
               def render_step(el, depth=0):
@@ -769,26 +718,23 @@ jobs:
                   title, detail = describe_element(el)
                   indent = Inches(0.25 + depth * 0.25)
 
-                  # Step header paragraph
                   p   = doc.add_paragraph()
                   p.paragraph_format.left_indent = indent
                   p.paragraph_format.space_after = Pt(2)
                   num_run = p.add_run(f"Step {step_num[0]}  ")
                   num_run.bold = True
-                  num_run.font.color.rgb = BLUE_MID
+                  set_font_color(num_run, BLUE_MID)
                   num_run.font.size = Pt(10)
                   title_run = p.add_run(title)
                   title_run.bold = True
                   title_run.font.size = Pt(10)
 
-                  # Detail line
                   if detail:
                       d = doc.add_paragraph()
                       d.paragraph_format.left_indent = Inches(0.25 + depth * 0.25 + 0.2)
                       d.paragraph_format.space_after = Pt(1)
                       d.add_run(detail).font.size = Pt(9)
 
-                  # Inline DataWeave for this step
                   dw_scripts = get_dw_for_element(el)
                   if dw_scripts:
                       for label, script in dw_scripts:
@@ -797,9 +743,8 @@ jobs:
                           lp.paragraph_format.space_after = Pt(1)
                           lr = lp.add_run(f'DataWeave — {label}')
                           lr.italic = True
-                          lr.font.color.rgb = GREEN_DARK
+                          set_font_color(lr, GREEN_DARK)
                           lr.font.size = Pt(9)
-                          # code block indented further
                           for line in script.strip().split('\n'):
                               cp = doc.add_paragraph()
                               cp.paragraph_format.left_indent = Inches(0.25 + depth * 0.25 + 0.35)
@@ -814,10 +759,9 @@ jobs:
                               cr = cp.add_run(line if line else ' ')
                               cr.font.name  = 'Courier New'
                               cr.font.size  = Pt(8)
-                              cr.font.color.rgb = RGBColor(0x1A,0x1A,0x1A)
+                              set_font_color(cr, CODE_FG)
                           doc.add_paragraph().paragraph_format.space_after = Pt(2)
 
-                  # ── Compound steps: expand inner routes
                   if tag == 'scatter-gather':
                       routes = [c for c in el if get_tag(c) not in NOISE_TAGS]
                       for ri, route in enumerate(routes, 1):
@@ -826,7 +770,7 @@ jobs:
                           rp.paragraph_format.space_after = Pt(1)
                           rr = rp.add_run(f'↳ Parallel Route {ri}')
                           rr.bold = True
-                          rr.font.color.rgb = BLUE_LIGHT
+                          set_font_color(rr, BLUE_LIGHT)
                           rr.font.size = Pt(9)
                           for child in route:
                               render_step(child, depth + 1)
@@ -842,7 +786,7 @@ jobs:
                           rp.paragraph_format.space_after = Pt(1)
                           rr = rp.add_run(f'↳ When: {cond[:80]}' if rt == 'when' else '↳ Otherwise')
                           rr.bold = True
-                          rr.font.color.rgb = BLUE_LIGHT
+                          set_font_color(rr, BLUE_LIGHT)
                           rr.font.size = Pt(9)
                           for child in route:
                               render_step(child, depth + 1)
@@ -860,7 +804,7 @@ jobs:
                               ep.paragraph_format.space_after = Pt(1)
                               er = ep.add_run('↳ Error Handler (inside Try)')
                               er.bold = True
-                              er.font.color.rgb = RGBColor(0xC0, 0x30, 0x30)
+                              set_font_color(er, ERR_RED)
                               er.font.size = Pt(9)
                               for h in c:
                                   render_step(h, depth + 1)
@@ -870,16 +814,14 @@ jobs:
                           if get_tag(child) not in NOISE_TAGS:
                               render_step(child, depth + 1)
 
-              # Walk top-level children
               for child in flow_el:
                   if get_tag(child) not in NOISE_TAGS:
                       render_step(child, depth=0)
-                      # thin separator between steps
                       sep = doc.add_paragraph()
                       sep.paragraph_format.space_after = Pt(1)
 
           # ─────────────────────────────────────────────────────────────
-          # TRIGGER → overview sentence
+          # OVERVIEW SENTENCE
           # ─────────────────────────────────────────────────────────────
           def build_overview(flow_el, trigger_info):
               children  = list(flow_el)
@@ -917,32 +859,27 @@ jobs:
           # DOCUMENT ONE FLOW
           # ─────────────────────────────────────────────────────────────
           def document_flow(doc, flow_el, filename):
-              flow_name = flow_el.attrib.get('name','Unnamed Flow')
-              flow_type = get_tag(flow_el)
+              flow_name    = flow_el.attrib.get('name','Unnamed Flow')
+              flow_type    = get_tag(flow_el)
               trigger_info = parse_trigger(flow_el)
 
-              # Heading
               doc.add_heading(f'Flow: {flow_name}', level=2)
               add_kv(doc, 'Source File', filename)
               add_kv(doc, 'Flow Type',   flow_type)
               doc.add_paragraph()
 
-              # Overview
               doc.add_heading('Overview', level=3)
               p = doc.add_paragraph(build_overview(flow_el, trigger_info))
               p.paragraph_format.space_after = Pt(6)
 
-              # Mermaid diagram
               doc.add_heading('Flow Diagram', level=3)
               add_mermaid_block(doc, build_mermaid(flow_el))
 
-              # Trigger
               doc.add_heading('Trigger', level=3)
               for k, v in trigger_info.items():
                   add_kv(doc, k, v, indent=True)
               doc.add_paragraph()
 
-              # Inputs
               doc.add_heading('Inputs', level=3)
               ttype = trigger_info.get('Type','')
               if 'HTTP' in ttype:
@@ -966,7 +903,6 @@ jobs:
                   add_bullet(doc, 'Payload: Depends on trigger / caller')
               doc.add_paragraph()
 
-              # Logic Steps with inline DataWeave
               doc.add_heading('Logic Steps', level=3)
               p = doc.add_paragraph()
               p.add_run(
@@ -977,7 +913,6 @@ jobs:
               add_logic_steps_with_dw(doc, flow_el)
               doc.add_paragraph()
 
-              # Connectors & Components
               doc.add_heading('Connectors & Components Used', level=3)
               rows = extract_connectors(flow_el)
               add_table(doc,
@@ -986,7 +921,6 @@ jobs:
                         [1.8, 1.2, 1.5, 1.8])
               doc.add_paragraph()
 
-              # Error Handling
               doc.add_heading('Error Handling', level=3)
               handlers = extract_error_handling(flow_el)
               if handlers:
@@ -1003,13 +937,11 @@ jobs:
                   add_bullet(doc, 'Error Types Caught: None')
                   add_bullet(doc, 'Handler Logic: Errors propagate to default Mule error handler')
 
-              # Outputs
               doc.add_heading('Outputs', level=3)
               vars_set = extract_set_vars(flow_el)
               add_bullet(doc, 'Payload: As set by the last transform or connector in the flow')
               add_bullet(doc, f"Variables Set: {', '.join(vars_set) if vars_set else 'None'}")
 
-              # Flow References
               doc.add_heading('Flow References', level=3)
               refs = extract_flow_refs(flow_el)
               if refs:
@@ -1018,7 +950,6 @@ jobs:
               else:
                   doc.add_paragraph('None').italic = True
 
-              # Config Properties
               doc.add_heading('Configuration Properties Used', level=3)
               props = extract_config_props(flow_el)
               if props:
@@ -1031,7 +962,7 @@ jobs:
               doc.add_paragraph()
 
           # ─────────────────────────────────────────────────────────────
-          # FIND MULE XML FILES ONLY
+          # FIND MULE XML FILES
           # ─────────────────────────────────────────────────────────────
           xml_files      = []
           seen_filenames = set()
@@ -1067,21 +998,21 @@ jobs:
           cr = cp.add_run('MuleSoft Flow Documentation')
           cr.bold = True
           cr.font.size = Pt(28)
-          cr.font.color.rgb = BLUE_DARK
+          set_font_color(cr, BLUE_DARK)
 
           doc.add_paragraph()
           sp = doc.add_paragraph()
           sp.alignment = WD_ALIGN_PARAGRAPH.CENTER
           sr = sp.add_run(f'Generated from: {JAR_NAME}')
           sr.font.size = Pt(13)
-          sr.font.color.rgb = BLUE_LIGHT
+          set_font_color(sr, BLUE_LIGHT)
 
           doc.add_paragraph()
           mp = doc.add_paragraph()
           mp.alignment = WD_ALIGN_PARAGRAPH.CENTER
           mr = mp.add_run(f'Date: {TODAY}  |  Branch: {GITHUB_REF}  |  Commit: {GITHUB_SHA}')
           mr.font.size = Pt(10)
-          mr.font.color.rgb = GREY
+          set_font_color(mr, GREY)
           doc.add_page_break()
 
           # Summary
@@ -1119,7 +1050,6 @@ jobs:
                   tree    = ET.parse(xml_path)
                   root_el = tree.getroot()
 
-                  # Register any unknown namespaces found in this file
                   for el in root_el.iter():
                       uri = get_ns_uri(el)
                       if uri and uri not in KNOWN_NS:
