@@ -33,12 +33,15 @@ jobs:
           mkdir -p "$EXTRACT_DIR"
           unzip -o "$JAR_NAME" -d "$EXTRACT_DIR/"
           echo "EXTRACT_DIR=$EXTRACT_DIR" >> $GITHUB_ENV
-          echo "JAR_NAME=$JAR_NAME" >> $GITHUB_ENV
+          echo "JAR_NAME=$JAR_NAME"       >> $GITHUB_ENV
 
-      - name: List extracted XML files
+      - name: List all extracted files
         run: |
-          echo "XML files found in $EXTRACT_DIR:"
-          find "$EXTRACT_DIR" -name "*.xml" | sort
+          echo "=== All extracted files ==="
+          find "$EXTRACT_DIR" | sort
+          echo ""
+          echo "=== Mule XML files (containing <mule) ==="
+          find "$EXTRACT_DIR" -name "*.xml" | xargs grep -l "<mule" 2>/dev/null | sort || echo "None found"
 
       - name: Install Python dependencies
         run: pip install python-docx
@@ -46,9 +49,7 @@ jobs:
       - name: Generate Word Documentation
         run: |
           python3 << 'PYEOF'
-          import os
-          import re
-          import xml.etree.ElementTree as ET
+          import os, re, xml.etree.ElementTree as ET
           from datetime import date
           from docx import Document
           from docx.shared import Pt, RGBColor, Inches
@@ -57,19 +58,17 @@ jobs:
           from docx.oxml import OxmlElement
 
           # ─────────────────────────────────────────────────────────────
-          # CONFIG
+          # ENVIRONMENT
           # ─────────────────────────────────────────────────────────────
           EXTRACT_DIR = os.environ.get('EXTRACT_DIR', 'extracted')
           JAR_NAME    = os.environ.get('JAR_NAME', 'unknown.jar')
           TODAY       = date.today().isoformat()
           GITHUB_REF  = os.environ.get('GITHUB_REF_NAME', 'N/A')
           GITHUB_SHA  = os.environ.get('GITHUB_SHA', 'N/A')[:8]
-
-          # Output doc name = jar name without .jar
-          DOC_NAME = JAR_NAME.replace('.jar', '') + '-flow-documentation.docx'
+          DOC_NAME    = JAR_NAME.replace('.jar', '') + '-flow-documentation.docx'
 
           # ─────────────────────────────────────────────────────────────
-          # NAMESPACE REGISTRY — universal, works for any MuleSoft JAR
+          # NAMESPACE REGISTRY
           # ─────────────────────────────────────────────────────────────
           KNOWN_NS = {
               'http://www.mulesoft.org/schema/mule/core':              'mule',
@@ -88,40 +87,37 @@ jobs:
               'http://www.mulesoft.org/schema/mule/validation':        'validation',
               'http://www.mulesoft.org/schema/mule/aggregators':       'aggregators',
               'http://www.mulesoft.org/schema/mule/batch':             'batch',
-              'http://www.mulesoft.org/schema/mule/oauth':             'oauth',
-              'http://www.mulesoft.org/schema/mule/secure-properties': 'secure-properties',
               'http://www.mulesoft.org/schema/mule/compression':       'compression',
               'http://www.mulesoft.org/schema/mule/crypto':            'crypto',
-              'http://www.mulesoft.org/schema/mule/json-logger':       'json-logger',
           }
 
-          # Tags that are sub-config elements, not real flow steps
+          MULE_CORE_NS = 'http://www.mulesoft.org/schema/mule/core'
+          EE_NS        = 'http://www.mulesoft.org/schema/mule/ee/core'
+
+          # Sub-config elements that are NOT logic steps
           NOISE_TAGS = {
-              'bulk-input-parameters', 'sql', 'input-parameters', 'default-value',
-              'value', 'query-params', 'response-validator', 'success-status-code-validator',
-              'request-connection', 'listener-connection', 'scheduling-strategy',
-              'fixed-frequency', 'cron', 'message', 'variables', 'body',
-              'headers', 'uri-params', 'correlation-id', 'success-response',
-              'failure-response', 'reconnect', 'reconnect-forever',
-              'pooling-profile', 'connection', 'parameters',
+              'bulk-input-parameters','sql','input-parameters','default-value',
+              'value','query-params','response-validator','success-status-code-validator',
+              'request-connection','listener-connection','scheduling-strategy',
+              'fixed-frequency','cron','message','variables','body','headers',
+              'uri-params','correlation-id','success-response','failure-response',
+              'reconnect','reconnect-forever','pooling-profile','connection','parameters',
+              'reconnection','expiration-policy','redelivery-policy',
           }
 
-          # Tags that are real visible connectors/components
-          CONNECTOR_TAGS = {
-              'listener', 'request', 'bulk-insert', 'insert', 'update', 'delete',
-              'select', 'stored-procedure', 'retrieve', 'store', 'contains', 'remove',
-              'publish', 'consume', 'subscribe', 'read', 'write', 'copy', 'move', 'list',
-              'query', 'create', 'upsert', 'create-job', 'batch-commit', 'execute',
-              'send', 'send-email', 'smtp', 'invoke', 'call',
+          # XML files that are definitely not Mule flows
+          NON_MULE_FILENAMES = {
+              'pom.xml','log4j2.xml','log4j.xml','application-types.xml',
+              'beans.xml','web.xml','context.xml','persistence.xml',
           }
 
           SKIP_DIRS = {
-              '.mule', '.settings', 'cache', 'offheap-disk-store',
-              'test', 'munit', 'java', 'api', 'wsdl', 'xsd',
+              '.mule','.settings','cache','offheap-disk-store',
+              'test','munit','java','api','wsdl','xsd','repository',
           }
 
           # ─────────────────────────────────────────────────────────────
-          # UTILITIES
+          # HELPERS
           # ─────────────────────────────────────────────────────────────
           def get_tag(el):
               return el.tag.split('}')[-1] if '}' in el.tag else el.tag
@@ -131,470 +127,528 @@ jobs:
 
           def get_prefix(el):
               uri = get_ns_uri(el)
-              return KNOWN_NS.get(uri, uri.split('/')[-1] if uri else 'mule')
+              if uri in KNOWN_NS:
+                  return KNOWN_NS[uri]
+              if uri:
+                  short = uri.rstrip('/').split('/')[-1]
+                  KNOWN_NS[uri] = short
+                  return short
+              return 'mule'
+
+          def is_mule_file(path):
+              """Return True only if file is a MuleSoft flow XML."""
+              fname = os.path.basename(path)
+              if fname in NON_MULE_FILENAMES:
+                  return False
+              try:
+                  tree = ET.parse(path)
+                  root = tree.getroot()
+                  ns   = get_ns_uri(root)
+                  # Must have mule core namespace in root
+                  return MULE_CORE_NS in ns or 'mulesoft.org/schema/mule' in ns
+              except:
+                  return False
 
           def safe(val, default='—'):
               return str(val).strip() if val and str(val).strip() else default
 
+          def clean_mermaid(text):
+              text = str(text)
+              text = re.sub(r'["\[\]{}|<>]', '', text)
+              text = re.sub(r'\s+', ' ', text).strip()
+              return text[:55] + ('...' if len(text) > 55 else '')
+
           # ─────────────────────────────────────────────────────────────
-          # HUMAN-READABLE STEP DESCRIPTIONS — works for ANY connector
+          # STEP DESCRIPTION — for logic step table AND mermaid node label
           # ─────────────────────────────────────────────────────────────
           def describe_element(el):
               tag    = get_tag(el)
               prefix = get_prefix(el)
               a      = el.attrib
 
-              # Core Mule components
               if tag == 'logger':
                   msg = a.get('message','')
                   lvl = a.get('level','INFO')
-                  return f"Logger ({lvl}) — logs: {msg[:80]}{'...' if len(msg)>80 else ''}"
+                  return f"Logger ({lvl})", f"Logs: {msg[:60]}{'...' if len(msg)>60 else ''}"
+
               if tag == 'set-payload':
                   val = a.get('value','')
-                  return f"Set Payload — {val[:80] if val else 'sets message payload'}"
+                  return "Set Payload", f"Sets payload to: {val[:60] if val else '(see DataWeave)'}"
+
               if tag == 'set-variable':
-                  return f"Set Variable '{a.get('variableName','?')}' = {a.get('value','?')[:60]}"
-              if tag == 'transform' or (prefix == 'ee' and tag == 'transform'):
-                  return "DataWeave Transform — transforms message payload/variables"
+                  return "Set Variable", f"Sets vars.{a.get('variableName','?')} = {str(a.get('value',''))[:50]}"
+
+              if tag in ('transform',) and prefix == 'ee':
+                  return "DataWeave Transform", "Transforms message payload / variables (see DataWeave below)"
+
               if tag == 'scatter-gather':
-                  return "Scatter-Gather — executes multiple routes in parallel, merges all results"
+                  return "Scatter-Gather", "Executes multiple routes in parallel and merges all results"
+
               if tag == 'choice':
-                  return "Choice Router — routes message based on conditional expression"
+                  return "Choice Router", "Routes message to different paths based on condition"
+
               if tag == 'try':
-                  return "Try Scope — wraps inner steps with isolated error handling"
+                  return "Try Scope", "Wraps steps with isolated error handling"
+
               if tag == 'error-handler':
-                  return "Error Handler — handles errors thrown within this scope"
+                  return "Error Handler", "Handles errors thrown within this scope"
+
               if tag == 'on-error-propagate':
-                  return f"On Error Propagate — propagates error (type: {a.get('type','ANY')})"
+                  return "On Error Propagate", f"Propagates error (type: {a.get('type','ANY')})"
+
               if tag == 'on-error-continue':
-                  return f"On Error Continue — swallows error and continues (type: {a.get('type','ANY')})"
+                  return "On Error Continue", f"Swallows error and continues (type: {a.get('type','ANY')})"
+
               if tag == 'flow-ref':
-                  return f"Flow Reference — delegates to sub-flow '{a.get('name','?')}'"
+                  return "Flow Reference", f"Calls sub-flow: {a.get('name','?')}"
+
               if tag == 'scheduler':
-                  return "Scheduler — triggers flow on a time-based schedule"
+                  return "Scheduler", "Triggers flow on a time-based schedule"
+
               if tag == 'async':
-                  return "Async — executes inner processors asynchronously"
+                  return "Async Scope", "Executes inner processors asynchronously"
+
               if tag == 'foreach':
-                  return f"For Each — iterates over collection '{a.get('collection','payload')}'"
+                  return "For Each", f"Iterates over collection: {a.get('collection','payload')}"
+
               if tag == 'parallel-foreach':
-                  return f"Parallel For Each — iterates in parallel over '{a.get('collection','payload')}'"
+                  return "Parallel For Each", f"Iterates in parallel over: {a.get('collection','payload')}"
+
               if tag == 'until-successful':
-                  return f"Until Successful — retries until success (max {a.get('maxRetries','?')} times)"
+                  return "Until Successful", f"Retries until success (max {a.get('maxRetries','?')} retries)"
+
               if tag == 'first-successful':
-                  return "First Successful — tries routes until one succeeds"
+                  return "First Successful", "Tries routes until one succeeds"
+
               if tag == 'round-robin':
-                  return "Round Robin — distributes messages across routes in round-robin order"
+                  return "Round Robin", "Distributes messages across routes in order"
 
               # HTTP
               if prefix == 'http' and tag == 'listener':
-                  return f"HTTP Listener — receives {a.get('allowedMethods','ANY')} requests at '{a.get('path','?')}'"
+                  return "HTTP Listener", f"Receives {a.get('allowedMethods','ANY')} requests at '{a.get('path','?')}'"
               if prefix == 'http' and tag == 'request':
-                  return f"HTTP Request ({a.get('method','GET')}) — calls '{a.get('url', a.get('path','?'))}'"
+                  return "HTTP Request", f"{a.get('method','GET')} → {a.get('url', a.get('path','?'))}"
 
-              # Database
+              # DB
               if prefix == 'db':
-                  ops = {
-                      'select':'Select — queries records from database',
-                      'insert':'Insert — inserts a record into database',
-                      'update':'Update — updates records in database',
-                      'delete':'Delete — deletes records from database',
-                      'bulk-insert':'Bulk Insert — inserts multiple records into database',
-                      'bulk-update':'Bulk Update — updates multiple records in database',
-                      'stored-procedure':'Stored Procedure — executes a DB stored procedure',
+                  op_map = {
+                      'select':'Select — queries records',
+                      'insert':'Insert — inserts a record',
+                      'update':'Update — updates records',
+                      'delete':'Delete — deletes records',
+                      'bulk-insert':'Bulk Insert — inserts multiple records',
+                      'bulk-update':'Bulk Update — updates multiple records',
+                      'stored-procedure':'Stored Procedure — executes DB procedure',
                   }
-                  return f"DB {ops.get(tag, tag)} (config: {a.get('config-ref','?')})"
+                  return f"DB {tag.replace('-',' ').title()}", op_map.get(tag, tag) + f" (config: {a.get('config-ref','?')})"
 
               # Object Store
               if prefix == 'os':
-                  ops = {
-                      'retrieve': f"Object Store Retrieve — reads key '{a.get('key','?')}' into '{a.get('target','?')}'",
-                      'store':    f"Object Store Store — saves value under key '{a.get('key','?')}'",
-                      'remove':   f"Object Store Remove — deletes key '{a.get('key','?')}'",
-                      'contains': f"Object Store Contains — checks if key '{a.get('key','?')}' exists",
+                  op_map = {
+                      'retrieve': f"Reads key '{a.get('key','?')}' → stores in vars.{a.get('target','?')}",
+                      'store':    f"Saves value under key '{a.get('key','?')}'",
+                      'remove':   f"Deletes key '{a.get('key','?')}'",
+                      'contains': f"Checks if key '{a.get('key','?')}' exists",
                   }
-                  return ops.get(tag, f"Object Store {tag}")
+                  return f"Object Store {tag.title()}", op_map.get(tag, tag)
 
               # File / FTP / SFTP
               if prefix in ('file','ftp','sftp'):
-                  ops = {
-                      'listener': f"{prefix.upper()} Listener — watches '{a.get('directory','?')}' for new/updated files",
-                      'read':     f"{prefix.upper()} Read — reads file '{a.get('path','?')}'",
-                      'write':    f"{prefix.upper()} Write — writes to '{a.get('path','?')}'",
-                      'copy':     f"{prefix.upper()} Copy — copies '{a.get('sourcePath','?')}' to '{a.get('targetPath','?')}'",
-                      'move':     f"{prefix.upper()} Move — moves '{a.get('sourcePath','?')}' to '{a.get('targetPath','?')}'",
-                      'delete':   f"{prefix.upper()} Delete — deletes '{a.get('path','?')}'",
-                      'list':     f"{prefix.upper()} List — lists files in '{a.get('directoryPath','?')}'",
+                  op_map = {
+                      'listener': f"Watches '{a.get('directory','?')}' for new/updated files",
+                      'read':     f"Reads file at '{a.get('path','?')}'",
+                      'write':    f"Writes to '{a.get('path','?')}'",
+                      'copy':     f"Copies '{a.get('sourcePath','?')}' → '{a.get('targetPath','?')}'",
+                      'move':     f"Moves '{a.get('sourcePath','?')}' → '{a.get('targetPath','?')}'",
+                      'delete':   f"Deletes '{a.get('path','?')}'",
+                      'list':     f"Lists files in '{a.get('directoryPath','?')}'",
                   }
-                  return ops.get(tag, f"{prefix.upper()} {tag}")
+                  return f"{prefix.upper()} {tag.title()}", op_map.get(tag, tag)
 
               # JMS / VM
               if prefix in ('jms','vm'):
-                  ops = {
-                      'listener':  f"{prefix.upper()} Listener — subscribes to '{a.get('destination', a.get('queueName','?'))}'",
-                      'publish':   f"{prefix.upper()} Publish — sends message to '{a.get('destination', a.get('queueName','?'))}'",
-                      'consume':   f"{prefix.upper()} Consume — consumes from '{a.get('destination', a.get('queueName','?'))}'",
-                      'subscribe': f"{prefix.upper()} Subscribe — subscribes to '{a.get('destination','?')}'",
+                  op_map = {
+                      'listener':  f"Subscribes to '{a.get('destination', a.get('queueName','?'))}'",
+                      'publish':   f"Sends message to '{a.get('destination', a.get('queueName','?'))}'",
+                      'consume':   f"Consumes from '{a.get('destination', a.get('queueName','?'))}'",
                   }
-                  return ops.get(tag, f"{prefix.upper()} {tag}")
+                  return f"{prefix.upper()} {tag.title()}", op_map.get(tag, tag)
 
               # Salesforce
               if prefix == 'salesforce':
-                  return f"Salesforce {tag.replace('-',' ').title()} — object: {a.get('type', a.get('sObjectType','?'))}"
+                  return f"Salesforce {tag.replace('-',' ').title()}", f"Object type: {a.get('type', a.get('sObjectType','?'))}"
 
               # Email
               if prefix == 'email':
-                  ops = {
-                      'send': f"Email Send — sends email via config '{a.get('config-ref','?')}'",
-                      'list-imap': "Email List IMAP — lists emails from IMAP inbox",
-                      'list-pop3': "Email List POP3 — lists emails from POP3 inbox",
-                  }
-                  return ops.get(tag, f"Email {tag}")
+                  return f"Email {tag.title()}", f"Via config: {a.get('config-ref','?')}"
 
-              # Fallback — generic but readable
-              config = a.get('config-ref','')
-              config_str = f" (config: {config})" if config else ''
-              return f"{prefix}:{tag}{config_str}"
+              # Generic fallback
+              cfg = a.get('config-ref','')
+              return f"{prefix}:{tag}", f"Config: {cfg}" if cfg else ''
 
           # ─────────────────────────────────────────────────────────────
-          # MERMAID DIAGRAM GENERATOR — works for any flow structure
+          # DATAWEAVE EXTRACTOR — per element (not global)
+          # Returns list of (context_label, script) for ONE element
           # ─────────────────────────────────────────────────────────────
-          def sanitize_mermaid(text):
-              """Remove chars that break Mermaid labels."""
-              text = str(text)
-              text = re.sub(r'["\[\]{}|<>]', '', text)
-              text = text.replace('\n', ' ').replace('\r', '')
-              return text[:60] + ('...' if len(text) > 60 else '')
-
-          node_counter = [0]
-          def new_node():
-              node_counter[0] += 1
-              return f"N{node_counter[0]}"
-
-          def build_mermaid(flow_el, flow_name):
-              node_counter[0] = 0
-              lines = ['graph TD']
-              children = list(flow_el)
-              if not children:
-                  lines.append('    A[No components defined]')
-                  return '\n'.join(lines)
-
-              prev = None
-              for child in children:
-                  tag    = get_tag(child)
-                  prefix = get_prefix(child)
-                  a      = child.attrib
-
-                  if tag in NOISE_TAGS:
-                      continue
-
-                  nid = new_node()
-
-                  # Special shapes for routers/scopes
-                  if tag == 'choice':
-                      label = sanitize_mermaid('Choice Router')
-                      node_def = f'    {nid}{{{label}}}'
-                      lines.append(node_def)
-                      if prev:
-                          lines.append(f'    {prev} --> {nid}')
-                      # Routes inside choice
-                      route_ids = []
-                      for when in child:
-                          wt = get_tag(when)
-                          if wt in ('when', 'otherwise'):
-                              cond = sanitize_mermaid(when.attrib.get('expression', 'otherwise'))
-                              rid = new_node()
-                              # First child inside when
-                              inner = list(when)
-                              if inner:
-                                  inner_tag = sanitize_mermaid(describe_element(inner[0])[:50])
-                                  lines.append(f'    {rid}[{inner_tag}]')
-                              else:
-                                  lines.append(f'    {rid}[{wt}]')
-                              lines.append(f'    {nid} -->|{cond}| {rid}')
-                              route_ids.append(rid)
-                      # Merge point
-                      mid = new_node()
-                      lines.append(f'    {mid}[Response]')
-                      for rid in route_ids:
-                          lines.append(f'    {rid} --> {mid}')
-                      prev = mid
-                      continue
-
-                  elif tag == 'scatter-gather':
-                      label = sanitize_mermaid('Scatter-Gather')
-                      lines.append(f'    {nid}[{label}]')
-                      if prev:
-                          lines.append(f'    {prev} --> {nid}')
-                      route_ids = []
-                      for ri, route in enumerate(child, 1):
-                          rt = get_tag(route)
-                          if rt in NOISE_TAGS:
-                              continue
-                          rid = new_node()
-                          inner = list(route)
-                          inner_label = sanitize_mermaid(describe_element(inner[0])[:45]) if inner else f'Route {ri}'
-                          lines.append(f'    {rid}[Route {ri}: {inner_label}]')
-                          lines.append(f'    {nid} --> {rid}')
-                          route_ids.append(rid)
-                      mid = new_node()
-                      lines.append(f'    {mid}[Merge Results]')
-                      for rid in route_ids:
-                          lines.append(f'    {rid} --> {mid}')
-                      prev = mid
-                      continue
-
-                  elif tag == 'try':
-                      label = sanitize_mermaid('Try Scope')
-                      lines.append(f'    {nid}[{label}]')
-                      if prev:
-                          lines.append(f'    {prev} --> {nid}')
-                      inner_prev = nid
-                      for inner in child:
-                          it = get_tag(inner)
-                          if it in ('error-handler',) or it in NOISE_TAGS:
-                              continue
-                          iid = new_node()
-                          ilabel = sanitize_mermaid(describe_element(inner)[:50])
-                          lines.append(f'    {iid}[{ilabel}]')
-                          lines.append(f'    {inner_prev} --> {iid}')
-                          inner_prev = iid
-                      # Error handler branch
-                      for inner in child:
-                          if get_tag(inner) == 'error-handler':
-                              eid = new_node()
-                              lines.append(f'    {eid}[On Error: continue]')
-                              lines.append(f'    {nid} -->|error| {eid}')
-                      prev = inner_prev
-                      continue
-
-                  elif tag == 'foreach' or tag == 'parallel-foreach':
-                      col = sanitize_mermaid(a.get('collection', 'payload')[:30])
-                      label = f"{'Parallel ' if tag=='parallel-foreach' else ''}For Each: {col}"
-                      lines.append(f'    {nid}[{sanitize_mermaid(label)}]')
-                      if prev:
-                          lines.append(f'    {prev} --> {nid}')
-                      inner_prev = nid
-                      for inner in child:
-                          if get_tag(inner) in NOISE_TAGS:
-                              continue
-                          iid = new_node()
-                          ilabel = sanitize_mermaid(describe_element(inner)[:50])
-                          lines.append(f'    {iid}[{ilabel}]')
-                          lines.append(f'    {inner_prev} --> {iid}')
-                          inner_prev = iid
-                      prev = inner_prev
-                      continue
-
-                  elif tag == 'error-handler':
-                      for handler in child:
-                          ht = get_tag(handler)
-                          eid = new_node()
-                          err_type = sanitize_mermaid(handler.attrib.get('type','ANY'))
-                          lines.append(f'    {eid}[{ht}: {err_type}]')
-                          if prev:
-                              lines.append(f'    {prev} -->|error| {eid}')
-                      continue
-
-                  # Generic component
-                  desc = sanitize_mermaid(describe_element(child)[:55])
-
-                  # Use diamond for routers, rounded for rest
-                  if tag in ('choice',):
-                      lines.append(f'    {nid}{{{desc}}}')
-                  else:
-                      lines.append(f'    {nid}[{desc}]')
-
-                  if prev:
-                      lines.append(f'    {prev} --> {nid}')
-                  prev = nid
-
-              return '\n'.join(lines)
-
-          # ─────────────────────────────────────────────────────────────
-          # DATAWEAVE EXTRACTOR — collects ALL DW scripts from any element
-          # ─────────────────────────────────────────────────────────────
-          def extract_dataweave(flow_el):
+          def get_dw_for_element(el):
               """
-              Returns list of (parent_context, script) tuples.
-              Deduplicates by script content.
-              Collects from:
-                - ee:set-payload (ee:transform body)
-                - ee:set-variable (ee:transform variables)
-                - set-payload value attribute if it starts with #[
-                - db:input-parameters, db:bulk-input-parameters
-                - os:value / os:default-value
-                - http:query-params / http:body / http:headers
-                - any element whose text looks like DataWeave
+              Returns all DataWeave scripts that belong to this specific element.
+              Checks:
+               - ee:transform children (ee:message/ee:set-payload, ee:variables/ee:set-variable)
+               - set-payload value="#[...]"
+               - db:input-parameters / db:bulk-input-parameters text
+               - os:value / os:default-value text
+               - http:query-params / http:body text
+               - logger message="#[...]"
+               - any child with text starting %dw or #[
               """
               scripts = []
-              seen   = set()
-              EE_NS  = 'http://www.mulesoft.org/schema/mule/ee/core'
+              seen    = set()
+              tag     = get_tag(el)
+              prefix  = get_prefix(el)
 
-              def add(context, script):
-                  script = script.strip()
-                  if script and script not in seen:
-                      seen.add(script)
-                      scripts.append((context, script))
+              def add(label, script):
+                  s = script.strip()
+                  if s and s not in seen:
+                      seen.add(s)
+                      scripts.append((label, s))
 
-              for el in flow_el.iter():
-                  tag    = get_tag(el)
-                  prefix = get_prefix(el)
-                  parent_tag = get_tag(el.getparent()) if hasattr(el, 'getparent') else ''
+              # ee:transform — collect payload + variable scripts
+              if tag == 'transform' and prefix == 'ee':
+                  for child in el.iter():
+                      ctag = get_tag(child)
+                      cns  = get_ns_uri(child)
+                      if cns == EE_NS and ctag == 'set-payload' and child.text:
+                          add('Output — payload', child.text)
+                      if cns == EE_NS and ctag == 'set-variable' and child.text:
+                          vname = child.attrib.get('variableName','?')
+                          add(f'Output — variable "{vname}"', child.text)
 
-                  # ee:transform → ee:message → ee:set-payload
-                  if el.tag == f'{{{EE_NS}}}set-payload' and el.text:
-                      # Find parent transform
-                      add('ee:transform → payload', el.text)
+              # set-payload inline DW
+              if tag == 'set-payload':
+                  val = el.attrib.get('value','')
+                  if val.startswith('#['):
+                      add('Inline expression', val)
+                  if el.text and el.text.strip():
+                      add('Body', el.text)
 
-                  # ee:transform → ee:variables → ee:set-variable
-                  if el.tag == f'{{{EE_NS}}}set-variable' and el.text:
-                      vname = el.attrib.get('variableName','?')
-                      add(f'ee:transform → variable "{vname}"', el.text)
+              # logger inline DW
+              if tag == 'logger':
+                  msg = el.attrib.get('message','')
+                  if msg.startswith('#[') and len(msg) > 5:
+                      add('Inline expression', msg)
 
-                  # set-payload value with inline DW
-                  if tag == 'set-payload':
-                      val = el.attrib.get('value','')
-                      if val.startswith('#['):
-                          add('set-payload (inline)', val)
-                      if el.text and el.text.strip():
-                          add('set-payload (body)', el.text)
+              # db — collect sql + input-parameters
+              if prefix == 'db':
+                  for child in el:
+                      ctag = get_tag(child)
+                      if ctag == 'sql' and child.text:
+                          add('SQL Query', child.text)
+                      if ctag in ('input-parameters','bulk-input-parameters') and child.text:
+                          add(f'{ctag}', child.text)
 
-                  # db input parameters
-                  if tag in ('input-parameters','bulk-input-parameters') and el.text:
-                      add(f'db:{get_tag(el)} parameters', el.text)
+              # os — collect value / default-value
+              if prefix == 'os':
+                  for child in el:
+                      ctag = get_tag(child)
+                      if ctag in ('value','default-value') and child.text:
+                          add(ctag, child.text)
 
-                  # os value / default-value
-                  if tag in ('value','default-value') and prefix == 'os' and el.text:
-                      add(f'os:{tag}', el.text)
+              # http:request — collect query-params, body, headers
+              if prefix == 'http' and tag == 'request':
+                  for child in el.iter():
+                      ctag = get_tag(child)
+                      if ctag in ('query-params','body','headers') and child.text:
+                          add(ctag, child.text)
 
-                  # http query-params / body / headers inline DW
-                  if tag in ('query-params','body','headers') and prefix == 'http' and el.text:
-                      add(f'http:{tag}', el.text)
-
-                  # logger message inline DW
-                  if tag == 'logger':
-                      msg = el.attrib.get('message','')
-                      if msg.startswith('#['):
-                          add('logger (inline DW)', msg)
-
-                  # Any text node that looks like DataWeave
-                  if el.text and el.text.strip().startswith('%dw'):
-                      add(f'{prefix}:{tag} (body)', el.text)
+              # scatter-gather / choice / try / foreach — collect from nested transforms
+              # but only at the direct child level (not recursively — handled per-route)
+              if tag in ('scatter-gather','choice','try','foreach','parallel-foreach',
+                         'async','until-successful','first-successful','round-robin'):
+                  pass  # handled separately in route parsing
 
               return scripts
 
           # ─────────────────────────────────────────────────────────────
-          # CONNECTOR TABLE EXTRACTOR — universal
+          # MERMAID DIAGRAM — per flow, generic for any structure
+          # ─────────────────────────────────────────────────────────────
+          _node_id = [0]
+
+          def nid():
+              _node_id[0] += 1
+              return f"N{_node_id[0]}"
+
+          def build_mermaid(flow_el):
+              _node_id[0] = 0
+              lines = ['graph TD']
+
+              def process_children(children, prev_id):
+                  last = prev_id
+                  for el in children:
+                      tag    = get_tag(el)
+                      prefix = get_prefix(el)
+                      if tag in NOISE_TAGS:
+                          continue
+
+                      n = nid()
+                      title, detail = describe_element(el)
+
+                      if tag == 'choice':
+                          label = clean_mermaid(title)
+                          lines.append(f'    {n}{{{{{label}}}}}')
+                          if last:
+                              lines.append(f'    {last} --> {n}')
+                          merge = nid()
+                          lines.append(f'    {merge}([Merge / Response])')
+                          for route in el:
+                              rt = get_tag(route)
+                              if rt not in ('when','otherwise'):
+                                  continue
+                              cond = route.attrib.get('expression','otherwise')
+                              cond = clean_mermaid(cond)[:40]
+                              rn   = nid()
+                              # label from first meaningful child
+                              inner = [c for c in route if get_tag(c) not in NOISE_TAGS]
+                              if inner:
+                                  it, id_ = describe_element(inner[0])
+                                  rlabel  = clean_mermaid(f"{it}: {id_}")
+                              else:
+                                  rlabel = rt
+                              lines.append(f'    {rn}[{rlabel}]')
+                              lines.append(f'    {n} -->|{cond}| {rn}')
+                              lines.append(f'    {rn} --> {merge}')
+                          last = merge
+                          continue
+
+                      elif tag == 'scatter-gather':
+                          label = clean_mermaid(title)
+                          lines.append(f'    {n}[{label}]')
+                          if last:
+                              lines.append(f'    {last} --> {n}')
+                          merge = nid()
+                          lines.append(f'    {merge}([Merge Results])')
+                          routes = [c for c in el if get_tag(c) not in NOISE_TAGS]
+                          for ri, route in enumerate(routes, 1):
+                              rn    = nid()
+                              inner = [c for c in route if get_tag(c) not in NOISE_TAGS]
+                              if inner:
+                                  it, id_ = describe_element(inner[0])
+                                  rlabel  = clean_mermaid(f"Route {ri}: {it}")
+                              else:
+                                  rlabel = f"Route {ri}"
+                              lines.append(f'    {rn}[{rlabel}]')
+                              lines.append(f'    {n} --> {rn}')
+                              lines.append(f'    {rn} --> {merge}')
+                          last = merge
+                          continue
+
+                      elif tag == 'try':
+                          label = clean_mermaid(title)
+                          lines.append(f'    {n}[{label}]')
+                          if last:
+                              lines.append(f'    {last} --> {n}')
+                          # inner steps
+                          inner_children = [c for c in el
+                                            if get_tag(c) not in NOISE_TAGS
+                                            and get_tag(c) != 'error-handler']
+                          last = process_children(inner_children, n)
+                          # error branch
+                          for c in el:
+                              if get_tag(c) == 'error-handler':
+                                  en = nid()
+                                  for h in c:
+                                      ht = get_tag(h)
+                                      lines.append(f'    {en}[On Error: {ht}]')
+                                      lines.append(f'    {n} -->|error| {en}')
+                          continue
+
+                      elif tag in ('foreach','parallel-foreach','async','until-successful'):
+                          label = clean_mermaid(f"{title}: {detail}"[:55])
+                          lines.append(f'    {n}[{label}]')
+                          if last:
+                              lines.append(f'    {last} --> {n}')
+                          inner_children = [c for c in el if get_tag(c) not in NOISE_TAGS]
+                          last = process_children(inner_children, n)
+                          continue
+
+                      elif tag == 'error-handler':
+                          for h in el:
+                              ht   = get_tag(h)
+                              etyp = h.attrib.get('type','ANY')
+                              en   = nid()
+                              lines.append(f'    {en}[{clean_mermaid(ht)}: {clean_mermaid(etyp)}]')
+                              if last:
+                                  lines.append(f'    {last} -->|error| {en}')
+                          continue
+
+                      # Generic node
+                      label = clean_mermaid(f"{title}: {detail}" if detail else title)
+                      lines.append(f'    {n}[{label}]')
+                      if last:
+                          lines.append(f'    {last} --> {n}')
+                      last = n
+
+                  return last
+
+              children = [c for c in flow_el if get_tag(c) not in NOISE_TAGS]
+              process_children(children, None)
+
+              if len(lines) == 1:
+                  lines.append('    A[No components defined]')
+
+              return '\n'.join(lines)
+
+          # ─────────────────────────────────────────────────────────────
+          # CONNECTOR SUMMARY — universal
           # ─────────────────────────────────────────────────────────────
           def extract_connectors(flow_el):
-              """Returns list of (connector, operation, config_ref, notes) tuples."""
               rows = []
               seen = set()
-
               CONNECTOR_PREFIXES = {
                   'http','db','os','file','ftp','sftp','jms','vm',
-                  'salesforce','email','sockets','compression','crypto',
-                  'aggregators','batch','oauth','validation','json-logger',
+                  'salesforce','email','compression','crypto','validation',
               }
-              # Also include core mule components
-              CORE_COMPONENTS = {
+              CORE_SHOW = {
                   'logger','set-payload','set-variable','transform',
                   'scatter-gather','choice','flow-ref','foreach',
                   'parallel-foreach','try','async','until-successful',
-                  'first-successful','round-robin','scheduler',
+                  'scheduler',
               }
-
               for el in flow_el.iter():
                   tag    = get_tag(el)
                   prefix = get_prefix(el)
-
                   if tag in NOISE_TAGS:
                       continue
-
-                  is_connector = prefix in CONNECTOR_PREFIXES
-                  is_core      = (prefix == 'mule' or prefix == 'ee') and tag in CORE_COMPONENTS
-
-                  if not (is_connector or is_core):
+                  is_conn = prefix in CONNECTOR_PREFIXES
+                  is_core = prefix in ('mule','ee','') and tag in CORE_SHOW
+                  if not (is_conn or is_core):
                       continue
-
-                  # Build readable connector name
-                  if prefix in ('mule',''):
-                      connector = tag.replace('-',' ').title()
-                  else:
-                      connector = f"{prefix.upper()} / {tag.replace('-',' ').title()}"
-
+                  connector  = f"{prefix.upper()} {tag.replace('-',' ').title()}".strip() if is_conn else tag.replace('-',' ').title()
                   operation  = tag.replace('-',' ').title()
-                  config_ref = el.attrib.get('config-ref', '—')
-
-                  # Notes
-                  a = el.attrib
-                  notes_parts = []
+                  config_ref = el.attrib.get('config-ref','—')
+                  notes_bits = []
                   for attr in ('path','url','directory','destination','queueName',
                                'key','variableName','collection','name','type',
                                'allowedMethods','method','level','watermarkMode'):
-                      v = a.get(attr)
+                      v = el.attrib.get(attr)
                       if v:
-                          notes_parts.append(f"{attr}={v[:40]}")
-                  notes = ', '.join(notes_parts[:3]) if notes_parts else '—'
-
-                  key = f"{connector}::{operation}"
+                          notes_bits.append(f"{attr}={v[:35]}")
+                  notes = ', '.join(notes_bits[:2]) if notes_bits else '—'
+                  key   = f"{connector}::{operation}"
                   if key not in seen:
                       seen.add(key)
                       rows.append((connector, operation, config_ref, notes))
-
               return rows
-
-          # ─────────────────────────────────────────────────────────────
-          # CONFIG PROPERTIES & FLOW REFS EXTRACTOR
-          # ─────────────────────────────────────────────────────────────
-          def extract_config_props(flow_el):
-              props = set()
-              for el in flow_el.iter():
-                  for val in el.attrib.values():
-                      for match in re.findall(r'\$\{[^}]+\}', val):
-                          props.add(match)
-                  if el.text:
-                      for match in re.findall(r'\$\{[^}]+\}', el.text):
-                          props.add(match)
-              return sorted(props)
-
-          def extract_flow_refs(flow_el):
-              refs = []
-              for el in flow_el.iter():
-                  if get_tag(el) == 'flow-ref':
-                      refs.append(el.attrib.get('name','?'))
-              return refs
 
           def extract_error_handling(flow_el):
               handlers = []
               for el in flow_el.iter():
                   if get_tag(el) == 'error-handler':
-                      for handler in el:
-                          strategy   = get_tag(handler)
-                          error_type = handler.attrib.get('type','ANY')
-                          notify     = handler.attrib.get('enableNotifications','true')
-                          handlers.append((strategy, error_type, notify))
+                      for h in el:
+                          handlers.append((
+                              get_tag(h),
+                              h.attrib.get('type','ANY'),
+                              h.attrib.get('enableNotifications','true'),
+                          ))
               return handlers
 
-          def extract_outputs(flow_el):
-              """Detect set-variable and last transform to infer outputs."""
-              vars_set = []
+          def extract_config_props(flow_el):
+              props = set()
               for el in flow_el.iter():
-                  if get_tag(el) == 'set-variable':
-                      vname = el.attrib.get('variableName','?')
-                      if vname not in vars_set:
-                          vars_set.append(vname)
-              return vars_set
+                  for v in el.attrib.values():
+                      props.update(re.findall(r'\$\{[^}]+\}', v))
+                  if el.text:
+                      props.update(re.findall(r'\$\{[^}]+\}', el.text))
+              return sorted(props)
+
+          def extract_flow_refs(flow_el):
+              return [el.attrib.get('name','?')
+                      for el in flow_el.iter() if get_tag(el) == 'flow-ref']
+
+          def extract_set_vars(flow_el):
+              return list(dict.fromkeys(
+                  el.attrib.get('variableName','?')
+                  for el in flow_el.iter() if get_tag(el) == 'set-variable'
+              ))
 
           # ─────────────────────────────────────────────────────────────
-          # WORD DOC STYLING HELPERS
+          # TRIGGER PARSER
+          # ─────────────────────────────────────────────────────────────
+          def parse_trigger(flow_el):
+              children = list(flow_el)
+              if not children:
+                  return {'Type': 'None — no trigger defined'}
+              t      = children[0]
+              tag    = get_tag(t)
+              prefix = get_prefix(t)
+              a      = t.attrib
+              info   = {}
+
+              if tag == 'listener' and prefix == 'http':
+                  info = {
+                      'Type':       'HTTP Listener',
+                      'Path':       a.get('path','—'),
+                      'Method':     a.get('allowedMethods','ANY (not restricted)'),
+                      'Config Ref': a.get('config-ref','—'),
+                  }
+              elif tag == 'listener' and prefix == 'file':
+                  info = {
+                      'Type':          'File Listener (On New or Updated File)',
+                      'Directory':     a.get('directory','—'),
+                      'Move To':       a.get('moveToDirectory','—'),
+                      'Watermark Mode':a.get('watermarkMode','—'),
+                      'Config Ref':    a.get('config-ref','—'),
+                  }
+                  for s in t.iter():
+                      if get_tag(s) == 'fixed-frequency':
+                          info['Schedule'] = f"Every {s.attrib.get('frequency','?')} {s.attrib.get('timeUnit','?')}"
+              elif tag == 'scheduler':
+                  info = {'Type': 'Scheduler'}
+                  for s in t.iter():
+                      if get_tag(s) == 'fixed-frequency':
+                          info['Schedule'] = f"Fixed frequency — every {s.attrib.get('frequency','?')} {s.attrib.get('timeUnit','?')}"
+                      elif get_tag(s) == 'cron':
+                          info['Cron Expression'] = s.attrib.get('expression','—')
+                          info['Time Zone']        = s.attrib.get('timeZone','—')
+              elif tag == 'listener' and prefix == 'jms':
+                  info = {
+                      'Type':        'JMS Listener',
+                      'Destination': a.get('destination', a.get('queueName','—')),
+                      'Config Ref':  a.get('config-ref','—'),
+                  }
+              elif tag == 'listener' and prefix == 'vm':
+                  info = {
+                      'Type':      'VM Listener',
+                      'Queue':     a.get('queueName','—'),
+                      'Config Ref':a.get('config-ref','—'),
+                  }
+              elif tag == 'listener' and prefix in ('ftp','sftp'):
+                  info = {
+                      'Type':       f'{prefix.upper()} Listener',
+                      'Directory':  a.get('directory','—'),
+                      'Config Ref': a.get('config-ref','—'),
+                  }
+                  for s in t.iter():
+                      if get_tag(s) == 'fixed-frequency':
+                          info['Schedule'] = f"Every {s.attrib.get('frequency','?')} {s.attrib.get('timeUnit','?')}"
+              elif tag == 'logger':
+                  info = {'Type': 'None (orphan/utility flow — starts with Logger, no trigger)'}
+              else:
+                  info = {'Type': f'{prefix}:{tag}', 'Config Ref': a.get('config-ref','—')}
+                  info.update({k: v for k, v in a.items()
+                                if k not in ('config-ref','doc:name','doc:id')})
+              return info
+
+          # ─────────────────────────────────────────────────────────────
+          # WORD DOC STYLE HELPERS
           # ─────────────────────────────────────────────────────────────
           BLUE_DARK  = RGBColor(0x1F, 0x49, 0x7D)
           BLUE_MID   = RGBColor(0x2E, 0x75, 0xB6)
           BLUE_LIGHT = RGBColor(0x44, 0x72, 0xC4)
           WHITE      = RGBColor(0xFF, 0xFF, 0xFF)
-          GREY_TEXT  = RGBColor(0x44, 0x44, 0x44)
-          CODE_COLOR = RGBColor(0x1A, 0x1A, 0x1A)
+          GREY       = RGBColor(0x44, 0x44, 0x44)
+          GREEN_DARK = RGBColor(0x1E, 0x6B, 0x3A)
+          CODE_BG    = 'F2F2F2'
 
           def shade_cell(cell, hex_color):
               tc   = cell._tc
@@ -605,61 +659,73 @@ jobs:
               shd.set(qn('w:fill'),  hex_color)
               tcPr.append(shd)
 
-          def add_divider(doc):
+          def add_divider(doc, color='2E75B6'):
               p   = doc.add_paragraph()
-              p.paragraph_format.space_before = Pt(4)
-              p.paragraph_format.space_after  = Pt(4)
+              p.paragraph_format.space_before = Pt(2)
+              p.paragraph_format.space_after  = Pt(2)
               pPr = p._p.get_or_add_pPr()
-              pBdr   = OxmlElement('w:pBdr')
-              bottom = OxmlElement('w:bottom')
-              bottom.set(qn('w:val'),   'single')
-              bottom.set(qn('w:sz'),    '6')
-              bottom.set(qn('w:space'), '1')
-              bottom.set(qn('w:color'), '2E75B6')
-              pBdr.append(bottom)
-              pPr.append(pBdr)
+              pBd = OxmlElement('w:pBdr')
+              bt  = OxmlElement('w:bottom')
+              bt.set(qn('w:val'),   'single')
+              bt.set(qn('w:sz'),    '6')
+              bt.set(qn('w:space'), '1')
+              bt.set(qn('w:color'), color)
+              pBd.append(bt)
+              pPr.append(pBd)
 
           def add_kv(doc, key, value, indent=False):
               p = doc.add_paragraph()
               p.paragraph_format.space_after = Pt(2)
               if indent:
-                  p.paragraph_format.left_indent = Inches(0.2)
+                  p.paragraph_format.left_indent = Inches(0.25)
               r1 = p.add_run(f"{key}: ")
               r1.bold = True
               r1.font.color.rgb = BLUE_DARK
-              r2 = p.add_run(safe(value))
-              r2.font.color.rgb = GREY_TEXT
+              p.add_run(safe(value)).font.color = None
 
-          def add_bullet(doc, text, indent=0.2):
-              p = doc.add_paragraph(style='List Bullet')
+          def add_bullet(doc, text, indent=0.25):
+              p = doc.add_paragraph()
               p.paragraph_format.left_indent  = Inches(indent)
               p.paragraph_format.space_after  = Pt(2)
-              p.add_run(text).font.size = Pt(10)
+              p.add_run('• ' + text).font.size = Pt(10)
 
-          def add_code_block(doc, code, label=None):
-              if label:
-                  p = doc.add_paragraph()
-                  p.paragraph_format.space_after = Pt(1)
-                  r = p.add_run(label)
-                  r.bold = True
-                  r.font.size = Pt(10)
-                  r.font.color.rgb = BLUE_DARK
+          def add_code_block(doc, code, small=False):
+              """Renders code in monospace Courier New with grey background."""
+              for line in code.strip().split('\n'):
+                  p   = doc.add_paragraph()
+                  p.paragraph_format.left_indent  = Inches(0.25)
+                  p.paragraph_format.right_indent = Inches(0.25)
+                  p.paragraph_format.space_before = Pt(0)
+                  p.paragraph_format.space_after  = Pt(0)
+                  # grey background via paragraph shading
+                  pPr = p._p.get_or_add_pPr()
+                  shd = OxmlElement('w:shd')
+                  shd.set(qn('w:val'),   'clear')
+                  shd.set(qn('w:color'), 'auto')
+                  shd.set(qn('w:fill'),  CODE_BG)
+                  pPr.append(shd)
+                  run = p.add_run(line if line else ' ')
+                  run.font.name  = 'Courier New'
+                  run.font.size  = Pt(8 if small else 9)
+                  run.font.color.rgb = RGBColor(0x1A, 0x1A, 0x1A)
+              doc.add_paragraph().paragraph_format.space_after = Pt(4)
+
+          def add_mermaid_block(doc, code):
+              """Renders mermaid diagram code in a styled code block."""
               p = doc.add_paragraph()
-              p.paragraph_format.left_indent  = Inches(0.3)
-              p.paragraph_format.space_before = Pt(2)
-              p.paragraph_format.space_after  = Pt(8)
-              run = p.add_run(code.strip())
-              run.font.name  = 'Courier New'
-              run.font.size  = Pt(9)
-              run.font.color.rgb = CODE_COLOR
+              r = p.add_run('Flow Diagram (Mermaid)')
+              r.bold = True
+              r.font.color.rgb = BLUE_MID
+              r.font.size = Pt(10)
+              add_code_block(doc, '```mermaid\n' + code + '\n```', small=True)
 
           def add_table(doc, headers, rows, col_widths):
               if not rows:
-                  doc.add_paragraph("None").italic = True
+                  doc.add_paragraph('None').italic = True
                   return
-              table = doc.add_table(rows=1, cols=len(headers))
-              table.style = 'Table Grid'
-              hdr_cells = table.rows[0].cells
+              tbl = doc.add_table(rows=1, cols=len(headers))
+              tbl.style = 'Table Grid'
+              hdr_cells = tbl.rows[0].cells
               for i, h in enumerate(headers):
                   hdr_cells[i].width = Inches(col_widths[i])
                   shade_cell(hdr_cells[i], '2E75B6')
@@ -669,212 +735,267 @@ jobs:
                   run.font.color.rgb = WHITE
                   run.font.size = Pt(10)
               for ri, row_data in enumerate(rows):
-                  row_cells = table.add_row().cells
-                  fill = 'EBF3FB' if ri % 2 == 0 else 'FFFFFF'
-                  for i, cell_text in enumerate(row_data):
-                      row_cells[i].width = Inches(col_widths[i])
-                      shade_cell(row_cells[i], fill)
-                      p   = row_cells[i].paragraphs[0]
-                      run = p.add_run(safe(cell_text))
+                  cells = tbl.add_row().cells
+                  fill  = 'EBF3FB' if ri % 2 == 0 else 'FFFFFF'
+                  for i, val in enumerate(row_data):
+                      cells[i].width = Inches(col_widths[i])
+                      shade_cell(cells[i], fill)
+                      p   = cells[i].paragraphs[0]
+                      run = p.add_run(safe(val))
                       run.font.size = Pt(9)
 
           # ─────────────────────────────────────────────────────────────
-          # PARSE TRIGGER (universal)
+          # LOGIC STEPS WITH INLINE DATAWEAVE
+          # This is the core new feature:
+          # For each step → show step row → then immediately show any DW
           # ─────────────────────────────────────────────────────────────
-          def parse_trigger(flow_el):
-              """Returns dict of trigger details for any trigger type."""
-              children = list(flow_el)
-              if not children:
-                  return {'type': 'None', 'details': {}}
+          def add_logic_steps_with_dw(doc, flow_el):
+              """
+              Renders each logic step as:
+                [Step N] Component Name — Description
+                  If DataWeave exists for this step, render it inline below.
+                  For compound steps (scatter-gather, choice, try, foreach):
+                    expand sub-routes with their own steps + DW.
+              """
+              step_num = [0]
 
-              trigger = children[0]
-              tag     = get_tag(trigger)
-              prefix  = get_prefix(trigger)
-              a       = trigger.attrib
-              details = {}
+              def render_step(el, depth=0):
+                  tag    = get_tag(el)
+                  prefix = get_prefix(el)
+                  if tag in NOISE_TAGS:
+                      return
 
-              if tag == 'listener' and prefix == 'http':
-                  details = {
-                      'Type':       'HTTP Listener',
-                      'Path':       a.get('path','—'),
-                      'Method':     a.get('allowedMethods','ANY (not restricted)'),
-                      'Config Ref': a.get('config-ref','—'),
-                  }
-              elif tag == 'listener' and prefix == 'file':
-                  details = {'Type': 'File Listener (On New or Updated File)'}
-                  details['Directory']     = a.get('directory','—')
-                  details['Move To']       = a.get('moveToDirectory','—')
-                  details['Watermark Mode']= a.get('watermarkMode','—')
-                  details['Config Ref']    = a.get('config-ref','—')
-                  for s in trigger.iter():
-                      if get_tag(s) == 'fixed-frequency':
-                          details['Schedule'] = f"Every {s.attrib.get('frequency','?')} {s.attrib.get('timeUnit','?')}"
-              elif tag == 'listener' and prefix in ('ftp','sftp'):
-                  details = {
-                      'Type':      f'{prefix.upper()} Listener',
-                      'Directory': a.get('directory','—'),
-                      'Config Ref':a.get('config-ref','—'),
-                  }
-                  for s in trigger.iter():
-                      if get_tag(s) == 'fixed-frequency':
-                          details['Schedule'] = f"Every {s.attrib.get('frequency','?')} {s.attrib.get('timeUnit','?')}"
-              elif tag == 'scheduler':
-                  details = {'Type': 'Scheduler'}
-                  for s in trigger.iter():
-                      if get_tag(s) == 'fixed-frequency':
-                          details['Schedule'] = f"Fixed frequency — every {s.attrib.get('frequency','?')} {s.attrib.get('timeUnit','?')}"
-                      if get_tag(s) == 'cron':
-                          details['Cron Expression'] = s.attrib.get('expression','—')
-                          details['Time Zone']        = s.attrib.get('timeZone','—')
-              elif tag == 'listener' and prefix == 'jms':
-                  details = {
-                      'Type':        'JMS Listener',
-                      'Destination': a.get('destination', a.get('queueName','—')),
-                      'Config Ref':  a.get('config-ref','—'),
-                  }
-              elif tag == 'listener' and prefix == 'vm':
-                  details = {
-                      'Type':      'VM Listener',
-                      'Queue':     a.get('queueName','—'),
-                      'Config Ref':a.get('config-ref','—'),
-                  }
-              elif tag == 'logger':
-                  details = {'Type': 'None (no trigger — orphan/utility flow that starts with Logger)'}
-              else:
-                  details = {
-                      'Type':      f'{prefix}:{tag}',
-                      'Config Ref':a.get('config-ref','—'),
-                  }
-                  details.update({k: v for k, v in a.items() if k != 'config-ref'})
+                  step_num[0] += 1
+                  title, detail = describe_element(el)
+                  indent = Inches(0.25 + depth * 0.25)
 
-              return details
+                  # Step header paragraph
+                  p   = doc.add_paragraph()
+                  p.paragraph_format.left_indent = indent
+                  p.paragraph_format.space_after = Pt(2)
+                  num_run = p.add_run(f"Step {step_num[0]}  ")
+                  num_run.bold = True
+                  num_run.font.color.rgb = BLUE_MID
+                  num_run.font.size = Pt(10)
+                  title_run = p.add_run(title)
+                  title_run.bold = True
+                  title_run.font.size = Pt(10)
+
+                  # Detail line
+                  if detail:
+                      d = doc.add_paragraph()
+                      d.paragraph_format.left_indent = Inches(0.25 + depth * 0.25 + 0.2)
+                      d.paragraph_format.space_after = Pt(1)
+                      d.add_run(detail).font.size = Pt(9)
+
+                  # Inline DataWeave for this step
+                  dw_scripts = get_dw_for_element(el)
+                  if dw_scripts:
+                      for label, script in dw_scripts:
+                          lp = doc.add_paragraph()
+                          lp.paragraph_format.left_indent = Inches(0.25 + depth * 0.25 + 0.2)
+                          lp.paragraph_format.space_after = Pt(1)
+                          lr = lp.add_run(f'DataWeave — {label}')
+                          lr.italic = True
+                          lr.font.color.rgb = GREEN_DARK
+                          lr.font.size = Pt(9)
+                          # code block indented further
+                          for line in script.strip().split('\n'):
+                              cp = doc.add_paragraph()
+                              cp.paragraph_format.left_indent = Inches(0.25 + depth * 0.25 + 0.35)
+                              cp.paragraph_format.space_before = Pt(0)
+                              cp.paragraph_format.space_after  = Pt(0)
+                              pPr = cp._p.get_or_add_pPr()
+                              shd = OxmlElement('w:shd')
+                              shd.set(qn('w:val'),   'clear')
+                              shd.set(qn('w:color'), 'auto')
+                              shd.set(qn('w:fill'),  CODE_BG)
+                              pPr.append(shd)
+                              cr = cp.add_run(line if line else ' ')
+                              cr.font.name  = 'Courier New'
+                              cr.font.size  = Pt(8)
+                              cr.font.color.rgb = RGBColor(0x1A,0x1A,0x1A)
+                          doc.add_paragraph().paragraph_format.space_after = Pt(2)
+
+                  # ── Compound steps: expand inner routes
+                  if tag == 'scatter-gather':
+                      routes = [c for c in el if get_tag(c) not in NOISE_TAGS]
+                      for ri, route in enumerate(routes, 1):
+                          rp = doc.add_paragraph()
+                          rp.paragraph_format.left_indent = Inches(0.25 + depth * 0.25 + 0.2)
+                          rp.paragraph_format.space_after = Pt(1)
+                          rr = rp.add_run(f'↳ Parallel Route {ri}')
+                          rr.bold = True
+                          rr.font.color.rgb = BLUE_LIGHT
+                          rr.font.size = Pt(9)
+                          for child in route:
+                              render_step(child, depth + 1)
+
+                  elif tag == 'choice':
+                      for route in el:
+                          rt   = get_tag(route)
+                          if rt not in ('when','otherwise'):
+                              continue
+                          cond = route.attrib.get('expression','otherwise')
+                          rp   = doc.add_paragraph()
+                          rp.paragraph_format.left_indent = Inches(0.25 + depth * 0.25 + 0.2)
+                          rp.paragraph_format.space_after = Pt(1)
+                          rr = rp.add_run(f'↳ When: {cond[:80]}' if rt == 'when' else '↳ Otherwise')
+                          rr.bold = True
+                          rr.font.color.rgb = BLUE_LIGHT
+                          rr.font.size = Pt(9)
+                          for child in route:
+                              render_step(child, depth + 1)
+
+                  elif tag == 'try':
+                      inner = [c for c in el
+                               if get_tag(c) not in NOISE_TAGS
+                               and get_tag(c) != 'error-handler']
+                      for child in inner:
+                          render_step(child, depth + 1)
+                      for c in el:
+                          if get_tag(c) == 'error-handler':
+                              ep = doc.add_paragraph()
+                              ep.paragraph_format.left_indent = Inches(0.25 + depth * 0.25 + 0.2)
+                              ep.paragraph_format.space_after = Pt(1)
+                              er = ep.add_run('↳ Error Handler (inside Try)')
+                              er.bold = True
+                              er.font.color.rgb = RGBColor(0xC0, 0x30, 0x30)
+                              er.font.size = Pt(9)
+                              for h in c:
+                                  render_step(h, depth + 1)
+
+                  elif tag in ('foreach','parallel-foreach','async','until-successful'):
+                      for child in el:
+                          if get_tag(child) not in NOISE_TAGS:
+                              render_step(child, depth + 1)
+
+              # Walk top-level children
+              for child in flow_el:
+                  if get_tag(child) not in NOISE_TAGS:
+                      render_step(child, depth=0)
+                      # thin separator between steps
+                      sep = doc.add_paragraph()
+                      sep.paragraph_format.space_after = Pt(1)
 
           # ─────────────────────────────────────────────────────────────
-          # DOCUMENT A SINGLE FLOW
+          # TRIGGER → overview sentence
+          # ─────────────────────────────────────────────────────────────
+          def build_overview(flow_el, trigger_info):
+              children  = list(flow_el)
+              step_count = len([c for c in children if get_tag(c) not in NOISE_TAGS])
+              ttype      = trigger_info.get('Type','Unknown')
+              path       = trigger_info.get('Path','')
+              sched      = trigger_info.get('Schedule','')
+              directory  = trigger_info.get('Directory','')
+
+              if 'HTTP' in ttype and path:
+                  return (f"An HTTP-triggered flow listening at `{path}` "
+                          f"[method: {trigger_info.get('Method','ANY')}]. "
+                          f"Contains {step_count} top-level processing step(s).")
+              if 'Scheduler' in ttype or sched:
+                  return (f"A scheduled flow that runs automatically "
+                          f"({sched or 'on a fixed schedule'}). "
+                          f"Contains {step_count} processing step(s).")
+              if 'File' in ttype and directory:
+                  return (f"A file-listener flow monitoring `{directory}` "
+                          f"for new or updated files. "
+                          f"Contains {step_count} processing step(s).")
+              if 'JMS' in ttype:
+                  return (f"A JMS listener flow consuming from `{trigger_info.get('Destination','?')}`. "
+                          f"Contains {step_count} processing step(s).")
+              if 'VM' in ttype:
+                  return (f"A VM listener flow consuming from queue `{trigger_info.get('Queue','?')}`. "
+                          f"Contains {step_count} processing step(s).")
+              if 'orphan' in ttype.lower() or 'None' in ttype:
+                  return ("A utility or debug flow with no trigger. "
+                          "Cannot be invoked automatically — must be called via flow-ref or manually.")
+              return (f"A `{get_tag(flow_el)}` triggered by `{ttype}` "
+                      f"with {step_count} top-level processing step(s).")
+
+          # ─────────────────────────────────────────────────────────────
+          # DOCUMENT ONE FLOW
           # ─────────────────────────────────────────────────────────────
           def document_flow(doc, flow_el, filename):
               flow_name = flow_el.attrib.get('name','Unnamed Flow')
               flow_type = get_tag(flow_el)
-              children  = list(flow_el)
+              trigger_info = parse_trigger(flow_el)
 
-              # ── Flow heading
-              doc.add_heading(f"Flow: `{flow_name}`", level=2)
+              # Heading
+              doc.add_heading(f'Flow: {flow_name}', level=2)
               add_kv(doc, 'Source File', filename)
               add_kv(doc, 'Flow Type',   flow_type)
+              doc.add_paragraph()
 
-              # ── Overview
+              # Overview
               doc.add_heading('Overview', level=3)
-              trigger_details = parse_trigger(flow_el)
-              ttype = trigger_details.get('Type','Unknown')
-              step_count = len([c for c in children if get_tag(c) not in NOISE_TAGS])
-              # Generic overview paragraph — works for any flow
-              tpath  = trigger_details.get('Path','')
-              tsched = trigger_details.get('Schedule','')
-              tdir   = trigger_details.get('Directory','')
-              if 'HTTP' in ttype and tpath:
-                  overview = (f"An HTTP-triggered flow listening at `{tpath}`. "
-                              f"It contains {step_count} processing step(s). "
-                              f"Review the Logic Steps section below for full details.")
-              elif 'Scheduler' in ttype or tsched:
-                  overview = (f"A scheduled flow that runs automatically ({tsched or 'on schedule'}). "
-                              f"It contains {step_count} processing step(s). "
-                              f"Review the Logic Steps section below for full details.")
-              elif 'File' in ttype and tdir:
-                  overview = (f"A file-listener flow monitoring directory `{tdir}`. "
-                              f"It contains {step_count} processing step(s). "
-                              f"Review the Logic Steps section below for full details.")
-              elif 'JMS' in ttype or 'VM' in ttype:
-                  dest = trigger_details.get('Destination', trigger_details.get('Queue','?'))
-                  overview = (f"A message-listener flow subscribing to `{dest}`. "
-                              f"It contains {step_count} processing step(s).")
-              elif 'None' in ttype or 'orphan' in ttype.lower():
-                  overview = ("A utility or debug flow with no trigger. "
-                              "It cannot be invoked automatically and is likely called via flow-ref or used for debugging.")
-              else:
-                  overview = (f"A `{flow_type}` triggered by `{ttype}` with {step_count} processing step(s).")
+              p = doc.add_paragraph(build_overview(flow_el, trigger_info))
+              p.paragraph_format.space_after = Pt(6)
 
-              p = doc.add_paragraph(overview)
-              p.paragraph_format.space_after = Pt(8)
-
-              # ── Flow Diagram
+              # Mermaid diagram
               doc.add_heading('Flow Diagram', level=3)
-              mermaid_code = build_mermaid(flow_el, flow_name)
-              add_code_block(doc, mermaid_code)
+              add_mermaid_block(doc, build_mermaid(flow_el))
 
-              # ── Trigger
+              # Trigger
               doc.add_heading('Trigger', level=3)
-              for k, v in trigger_details.items():
+              for k, v in trigger_info.items():
                   add_kv(doc, k, v, indent=True)
+              doc.add_paragraph()
 
-              # ── Inputs
+              # Inputs
               doc.add_heading('Inputs', level=3)
-              trigger_tag = get_tag(list(flow_el)[0]) if children else ''
-              if trigger_tag == 'listener' and trigger_details.get('Type','').startswith('HTTP'):
+              ttype = trigger_info.get('Type','')
+              if 'HTTP' in ttype:
                   add_bullet(doc, 'Payload: Depends on HTTP method and client request body')
-                  add_bullet(doc, f"Query Params: Inspect `{trigger_details.get('Path','')}` usage in logic steps")
+                  add_bullet(doc, f"Query Params: Inspect `{trigger_info.get('Path','')}` for param usage")
                   add_bullet(doc, 'Headers: As provided by the HTTP client')
-              elif 'Scheduler' in trigger_details.get('Type','') or trigger_tag == 'scheduler':
-                  add_bullet(doc, 'Payload: None (scheduler-triggered, no inbound payload)')
-                  add_bullet(doc, 'Variables: Set internally by the flow')
-              elif 'File' in trigger_details.get('Type',''):
-                  add_bullet(doc, 'Payload: File content (triggered by new/updated file)')
-                  add_bullet(doc, 'Attributes: File name, size, timestamps, path')
-              elif 'JMS' in trigger_details.get('Type','') or 'VM' in trigger_details.get('Type',''):
-                  add_bullet(doc, 'Payload: Message body from the queue/topic')
-                  add_bullet(doc, 'Attributes: Message headers and properties')
+                  add_bullet(doc, 'Variables: None expected at start')
+              elif 'Scheduler' in ttype or 'Fixed' in trigger_info.get('Schedule',''):
+                  add_bullet(doc, 'Payload: None (scheduler-triggered)')
+                  add_bullet(doc, 'Variables: Set internally during flow execution')
+              elif 'File' in ttype:
+                  add_bullet(doc, 'Payload: File content (binary or text)')
+                  add_bullet(doc, 'Attributes: File name, size, timestamps, directory path')
+              elif 'JMS' in ttype or 'VM' in ttype:
+                  add_bullet(doc, 'Payload: Message body from queue/topic')
+                  add_bullet(doc, 'Attributes: Message properties and headers')
+              elif 'orphan' in ttype.lower() or 'None' in ttype:
+                  add_bullet(doc, 'Payload: None (no trigger)')
+                  add_bullet(doc, 'Variables: Expected to be set before flow-ref call')
               else:
-                  add_bullet(doc, 'Payload: Depends on caller / trigger type')
+                  add_bullet(doc, 'Payload: Depends on trigger / caller')
+              doc.add_paragraph()
 
-              # ── Logic Steps
+              # Logic Steps with inline DataWeave
               doc.add_heading('Logic Steps', level=3)
-              step_rows = []
-              step_num  = 1
-              for child in children:
-                  tag = get_tag(child)
-                  if tag in NOISE_TAGS:
-                      continue
-                  desc = describe_element(child)
-                  step_rows.append([str(step_num), desc])
-                  step_num += 1
-
-              if step_rows:
-                  add_table(doc, ['Step', 'Description'], step_rows, [0.5, 5.8])
-              else:
-                  doc.add_paragraph("No logic steps found.").italic = True
+              p = doc.add_paragraph()
+              p.add_run(
+                  'Each step is shown below. Where a step contains a DataWeave script, '
+                  'it is shown inline immediately beneath that step.'
+              ).italic = True
+              p.paragraph_format.space_after = Pt(4)
+              add_logic_steps_with_dw(doc, flow_el)
               doc.add_paragraph()
 
-              # ── DataWeave Transformations
-              doc.add_heading('DataWeave Transformations', level=3)
-              dw_scripts = extract_dataweave(flow_el)
-              if dw_scripts:
-                  for idx, (context, script) in enumerate(dw_scripts, 1):
-                      add_code_block(doc, script, label=f"Transform {idx} — {context}")
-              else:
-                  doc.add_paragraph("None").italic = True
-              doc.add_paragraph()
-
-              # ── Connectors & Components
+              # Connectors & Components
               doc.add_heading('Connectors & Components Used', level=3)
-              connector_rows = extract_connectors(flow_el)
-              if connector_rows:
-                  add_table(doc,
-                            ['Connector', 'Operation', 'Config Ref', 'Notes'],
-                            connector_rows,
-                            [1.5, 1.2, 1.5, 2.1])
-              else:
-                  doc.add_paragraph("None detected.").italic = True
+              rows = extract_connectors(flow_el)
+              add_table(doc,
+                        ['Connector / Component', 'Operation', 'Config Ref', 'Key Attributes'],
+                        rows,
+                        [1.8, 1.2, 1.5, 1.8])
               doc.add_paragraph()
 
-              # ── Error Handling
+              # Error Handling
               doc.add_heading('Error Handling', level=3)
               handlers = extract_error_handling(flow_el)
               if handlers:
                   for strategy, error_type, notify in handlers:
-                      add_kv(doc, 'Strategy',           strategy,    indent=True)
-                      add_kv(doc, 'Error Types Caught', error_type,  indent=True)
-                      add_kv(doc, 'Notifications',      notify,      indent=True)
+                      add_kv(doc, 'Strategy',    strategy,   indent=True)
+                      add_kv(doc, 'Error Types', error_type, indent=True)
+                      add_kv(doc, 'Notifications', notify,   indent=True)
                       if strategy == 'on-error-continue':
-                          add_bullet(doc, 'Behaviour: Logs and continues — parent scope does not fail')
+                          add_bullet(doc, 'Behaviour: Logs error and continues — parent scope does not fail')
                       else:
                           add_bullet(doc, 'Behaviour: Propagates error to calling flow or default error handler')
               else:
@@ -882,38 +1003,35 @@ jobs:
                   add_bullet(doc, 'Error Types Caught: None')
                   add_bullet(doc, 'Handler Logic: Errors propagate to default Mule error handler')
 
-              # ── Outputs
+              # Outputs
               doc.add_heading('Outputs', level=3)
-              vars_set = extract_outputs(flow_el)
+              vars_set = extract_set_vars(flow_el)
               add_bullet(doc, 'Payload: As set by the last transform or connector in the flow')
-              if vars_set:
-                  add_bullet(doc, f"Variables Set: {', '.join(vars_set)}")
-              else:
-                  add_bullet(doc, 'Variables Set: None')
+              add_bullet(doc, f"Variables Set: {', '.join(vars_set) if vars_set else 'None'}")
 
-              # ── Flow References
+              # Flow References
               doc.add_heading('Flow References', level=3)
               refs = extract_flow_refs(flow_el)
               if refs:
-                  for ref in refs:
-                      add_bullet(doc, f"`{ref}` — called via flow-ref")
+                  for r in refs:
+                      add_bullet(doc, f'`{r}` — called via flow-ref')
               else:
-                  doc.add_paragraph("None").italic = True
+                  doc.add_paragraph('None').italic = True
 
-              # ── Config Properties
+              # Config Properties
               doc.add_heading('Configuration Properties Used', level=3)
               props = extract_config_props(flow_el)
               if props:
                   for p in props:
                       add_bullet(doc, p)
               else:
-                  doc.add_paragraph("None").italic = True
+                  doc.add_paragraph('None').italic = True
 
               add_divider(doc)
               doc.add_paragraph()
 
           # ─────────────────────────────────────────────────────────────
-          # FIND XML FILES
+          # FIND MULE XML FILES ONLY
           # ─────────────────────────────────────────────────────────────
           xml_files      = []
           seen_filenames = set()
@@ -927,134 +1045,128 @@ jobs:
               for root, dirs, files in os.walk(search_root):
                   dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
                   for f in sorted(files):
-                      if f.endswith('.xml') and f not in seen_filenames:
+                      if not f.endswith('.xml'):
+                          continue
+                      full_path = os.path.join(root, f)
+                      if f not in seen_filenames and is_mule_file(full_path):
                           seen_filenames.add(f)
-                          xml_files.append(os.path.join(root, f))
+                          xml_files.append(full_path)
 
-          print(f"\nFound {len(xml_files)} unique XML file(s):")
+          print(f'\nMule XML files to document ({len(xml_files)}):')
           for xf in xml_files:
-              print(f"  {xf}")
+              print(f'  {xf}')
 
           # ─────────────────────────────────────────────────────────────
           # BUILD DOCUMENT
           # ─────────────────────────────────────────────────────────────
           doc = Document()
 
-          # ── Cover page
-          title_p = doc.add_paragraph()
-          title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-          tr = title_p.add_run("MuleSoft Flow Documentation")
-          tr.bold = True
-          tr.font.size = Pt(28)
-          tr.font.color.rgb = BLUE_DARK
+          # Cover page
+          cp = doc.add_paragraph()
+          cp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+          cr = cp.add_run('MuleSoft Flow Documentation')
+          cr.bold = True
+          cr.font.size = Pt(28)
+          cr.font.color.rgb = BLUE_DARK
 
           doc.add_paragraph()
-          sub_p = doc.add_paragraph()
-          sub_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-          sr = sub_p.add_run(f"Generated from: {JAR_NAME}")
+          sp = doc.add_paragraph()
+          sp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+          sr = sp.add_run(f'Generated from: {JAR_NAME}')
           sr.font.size = Pt(13)
           sr.font.color.rgb = BLUE_LIGHT
 
           doc.add_paragraph()
-          meta_p = doc.add_paragraph()
-          meta_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-          mr = meta_p.add_run(f"Date: {TODAY}  |  Branch: {GITHUB_REF}  |  Commit: {GITHUB_SHA}")
+          mp = doc.add_paragraph()
+          mp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+          mr = mp.add_run(f'Date: {TODAY}  |  Branch: {GITHUB_REF}  |  Commit: {GITHUB_SHA}')
           mr.font.size = Pt(10)
-          mr.font.color.rgb = GREY_TEXT
-
+          mr.font.color.rgb = GREY
           doc.add_page_break()
 
-          # ── Summary section
-          doc.add_heading("Summary", level=1)
-          file_names = [os.path.basename(x) for x in xml_files]
-          add_kv(doc, "Generated from", ', '.join(f"`{f}`" for f in file_names))
-          add_kv(doc, "Date",           TODAY)
-          add_kv(doc, "Branch / Commit",f"{GITHUB_REF} / {GITHUB_SHA}")
+          # Summary
+          doc.add_heading('Summary', level=1)
+          add_kv(doc, 'Generated from', ', '.join(f'`{os.path.basename(x)}`' for x in xml_files))
+          add_kv(doc, 'Date',           TODAY)
+          add_kv(doc, 'Branch/Commit',  f'{GITHUB_REF} / {GITHUB_SHA}')
           doc.add_paragraph()
 
-          # Count total flows
           total_flows = 0
-          for xml_path in xml_files:
+          for xf in xml_files:
               try:
-                  tree   = ET.parse(xml_path)
-                  rel    = tree.getroot()
+                  r = ET.parse(xf).getroot()
                   total_flows += len(
-                      rel.findall('{http://www.mulesoft.org/schema/mule/core}flow') +
-                      rel.findall('{http://www.mulesoft.org/schema/mule/core}sub-flow')
+                      r.findall(f'{{{MULE_CORE_NS}}}flow') +
+                      r.findall(f'{{{MULE_CORE_NS}}}sub-flow')
                   )
-              except:
-                  pass
+              except: pass
 
           p = doc.add_paragraph(
-              f"This documentation covers {len(xml_files)} XML file(s) and {total_flows} flow(s) "
-              f"extracted from `{JAR_NAME}`. Each flow section below includes a Mermaid diagram, "
-              f"full DataWeave scripts verbatim, trigger details, logic steps, connectors used, "
-              f"error handling strategy, outputs, flow references, and configuration properties."
+              f'This documentation covers {len(xml_files)} Mule XML file(s) and '
+              f'{total_flows} flow(s) extracted from `{JAR_NAME}`. '
+              f'Each flow section includes: a Mermaid flow diagram, logic steps with '
+              f'inline DataWeave scripts, trigger details, connectors used, '
+              f'error handling, outputs, flow references, and configuration properties.'
           )
           p.paragraph_format.space_after = Pt(8)
           add_divider(doc)
           doc.add_page_break()
 
-          # ── Per-file, per-flow documentation
-          if not xml_files:
-              doc.add_paragraph("No XML flow files found in extracted JAR contents.")
-          else:
-              for xml_path in xml_files:
-                  fname = os.path.basename(xml_path)
-                  try:
-                      tree   = ET.parse(xml_path)
-                      root_el = tree.getroot()
+          # Per-file, per-flow
+          for xml_path in xml_files:
+              fname = os.path.basename(xml_path)
+              try:
+                  tree    = ET.parse(xml_path)
+                  root_el = tree.getroot()
 
-                      # Register all namespaces found in this file dynamically
-                      for el in root_el.iter():
-                          uri = get_ns_uri(el)
-                          if uri and uri not in KNOWN_NS:
-                              short = uri.split('/')[-1].split('.')[-1]
-                              KNOWN_NS[uri] = short
+                  # Register any unknown namespaces found in this file
+                  for el in root_el.iter():
+                      uri = get_ns_uri(el)
+                      if uri and uri not in KNOWN_NS:
+                          KNOWN_NS[uri] = uri.rstrip('/').split('/')[-1]
 
-                      flows = (
-                          root_el.findall('{http://www.mulesoft.org/schema/mule/core}flow') +
-                          root_el.findall('{http://www.mulesoft.org/schema/mule/core}sub-flow')
+                  flows = (
+                      root_el.findall(f'{{{MULE_CORE_NS}}}flow') +
+                      root_el.findall(f'{{{MULE_CORE_NS}}}sub-flow')
+                  )
+
+                  doc.add_heading(f'File: `{fname}`', level=1)
+
+                  if not flows:
+                      p = doc.add_paragraph(
+                          '> This file contains Mule global configurations or namespace '
+                          'declarations only — no flows are defined.'
                       )
-
-                      doc.add_heading(f"File: `{fname}`", level=1)
-
-                      if not flows:
-                          p = doc.add_paragraph(
-                              f"> This file contains a Mule XML skeleton with no flows defined — "
-                              f"only namespace declarations or global configs. "
-                              f"No flow documentation is generated for this file."
-                          )
-                          p.paragraph_format.space_after = Pt(8)
-                          add_divider(doc)
-                          doc.add_paragraph()
-                          continue
-
-                      for flow in flows:
-                          document_flow(doc, flow, fname)
-                          doc.add_page_break()
-
-                  except ET.ParseError as e:
-                      doc.add_heading(f"File: `{fname}`", level=1)
-                      doc.add_paragraph(f"Could not parse this file: {e}")
+                      p.italic = True
+                      p.paragraph_format.space_after = Pt(8)
                       add_divider(doc)
+                      doc.add_paragraph()
+                      continue
 
-          # ── Quality Checklist
-          doc.add_heading("Quality Checklist", level=1)
-          checks = [
-              "Every flow and sub-flow in every XML file is completely documented.",
-              "A Mermaid flow diagram is generated for every flow.",
-              "All DataWeave scripts are included verbatim (not summarized or truncated).",
-              "Trigger details are specific (path, method, schedule expression, etc.).",
-              "Input and output shapes are described for each flow.",
-              "Files with no flows are noted explicitly.",
-              "Document name matches JAR file name.",
-          ]
-          for check in checks:
-              add_bullet(doc, f"[x] {check}")
+                  for flow in flows:
+                      document_flow(doc, flow, fname)
+                      doc.add_page_break()
+
+              except ET.ParseError as e:
+                  doc.add_heading(f'File: `{fname}`', level=1)
+                  doc.add_paragraph(f'Could not parse this file: {e}')
+                  add_divider(doc)
+
+          # Quality Checklist
+          doc.add_heading('Quality Checklist', level=1)
+          for item in [
+              'Every Mule flow and sub-flow is completely documented.',
+              'Mermaid flow diagram generated for every flow.',
+              'DataWeave scripts shown inline under each step (not at the bottom).',
+              'Trigger details are specific (path, method, schedule, etc.).',
+              'Non-Mule XML files (pom.xml, log4j2.xml, etc.) are excluded.',
+              'Document name matches the JAR file name.',
+              'Each run creates a new document — no overwriting other JARs.',
+          ]:
+              add_bullet(doc, f'[x] {item}')
 
           doc.save(DOC_NAME)
-          print(f"\nDone — saved as: {DOC_NAME}")
+          print(f'\nSaved: {DOC_NAME}')
           PYEOF
 
       - name: Commit documentation
@@ -1064,5 +1176,5 @@ jobs:
           git config user.name "github-actions"
           git config user.email "actions@github.com"
           git add "${{ env.EXTRACT_DIR }}/" "$DOC_NAME"
-          git commit -m "docs: generated flow documentation for ${{ github.event.inputs.jar_file }}"
+          git commit -m "docs: flow documentation for ${{ github.event.inputs.jar_file }}"
           git push
