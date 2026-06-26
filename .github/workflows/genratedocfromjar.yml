@@ -707,7 +707,7 @@ jobs:
                   run = p.add_run(line if line else ' ')
                   run.font.name  = 'Courier New'
                   run.font.size  = Pt(8 if small else 9)
-                  run.font.color.rgb = RGBColor(0x1A, 0x1A, 0x1A)
+                  run.font.color = None
               doc.add_paragraph().paragraph_format.space_after = Pt(4)
 
           def add_mermaid_block(doc, code):
