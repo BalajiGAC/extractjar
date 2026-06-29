@@ -19,6 +19,8 @@ jobs:
         uses: actions/checkout@v3
         with:
           token: ${{ secrets.PAT_TOKEN }}
+          persist-credentials: true
+          fetch-depth: 0
 
       - name: Validate JAR exists
         run: |
@@ -693,9 +695,25 @@ jobs:
           JAR_BASE="${{ github.event.inputs.jar_file }}"
           DOC_NAME="${JAR_BASE%.jar}-flow-documentation.docx"
           BRANCH="docs/${JAR_BASE%.jar}"
-          git config user.name "github-actions"
-          git config user.email "actions@github.com"
+
+          # Set git identity
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Set remote URL with PAT explicitly so push is authenticated
+          git remote set-url origin https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/${{ github.repository }}.git
+
+          # Create or switch to docs branch based off current HEAD
           git checkout -b "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
-          git add "${{ env.EXTRACT_DIR }}/" "$DOC_NAME"
-          git commit -m "docs: Claude-generated flow documentation for ${{ github.event.inputs.jar_file }}"
-          git push origin "$BRANCH"
+
+          # Stage generated files
+          git add -f "${{ env.EXTRACT_DIR }}/" "$DOC_NAME" || true
+
+          # Commit only if there are staged changes
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "docs: Claude-generated flow documentation for ${{ github.event.inputs.jar_file }}"
+            git push origin "$BRANCH"
+            echo "Pushed to branch: $BRANCH"
+          fi
