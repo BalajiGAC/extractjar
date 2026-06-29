@@ -1,0 +1,701 @@
+name: MuleSoft JAR Documentation Generator (Claude API)
+
+on:
+  workflow_dispatch:
+    inputs:
+      jar_file:
+        description: 'JAR file name (e.g. hellomule.jar)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  generate-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Validate JAR exists
+        run: |
+          if [ ! -f "${{ github.event.inputs.jar_file }}" ]; then
+            echo "ERROR: JAR file '${{ github.event.inputs.jar_file }}' not found."
+            exit 1
+          fi
+
+      - name: Extract JAR
+        run: |
+          JAR_NAME="${{ github.event.inputs.jar_file }}"
+          EXTRACT_DIR="extracted_${JAR_NAME%.jar}"
+          mkdir -p "$EXTRACT_DIR"
+          unzip -o "$JAR_NAME" -d "$EXTRACT_DIR/"
+          echo "EXTRACT_DIR=$EXTRACT_DIR" >> $GITHUB_ENV
+          echo "JAR_NAME=$JAR_NAME" >> $GITHUB_ENV
+
+      - name: Install dependencies
+        run: pip install python-docx anthropic
+
+      - name: Write Python script
+        run: |
+          cat > /tmp/generate_docs.py << 'SCRIPTEOF'
+          import os, re, time, xml.etree.ElementTree as ET
+          from datetime import date
+          import anthropic
+          from docx import Document
+          from docx.shared import Pt, RGBColor, Inches
+          from docx.enum.text import WD_ALIGN_PARAGRAPH
+          from docx.oxml.ns import qn
+          from docx.oxml import OxmlElement
+
+          EXTRACT_DIR = os.environ.get('EXTRACT_DIR', 'extracted')
+          JAR_NAME    = os.environ.get('JAR_NAME', 'unknown.jar')
+          TODAY       = date.today().isoformat()
+          GITHUB_REF  = os.environ.get('GITHUB_REF_NAME', 'N/A')
+          GITHUB_SHA  = os.environ.get('GITHUB_SHA', 'N/A')[:8]
+          DOC_NAME    = JAR_NAME.replace('.jar', '') + '-flow-documentation.docx'
+          client      = anthropic.Anthropic(api_key=os.environ.get('ANTHROPIC_API_KEY'))
+          MULE_CORE_NS = 'http://www.mulesoft.org/schema/mule/core'
+
+          NON_MULE_FILENAMES = {
+              'pom.xml','log4j2.xml','log4j.xml','application-types.xml',
+              'beans.xml','web.xml','context.xml','persistence.xml',
+          }
+          SKIP_DIRS = {
+              '.mule','.settings','cache','offheap-disk-store',
+              'test','munit','java','api','wsdl','xsd','repository',
+          }
+
+          def get_ns_uri(el):
+              return el.tag.split('}')[0].strip('{') if '}' in el.tag else ''
+
+          def is_mule_file(path):
+              if os.path.basename(path) in NON_MULE_FILENAMES:
+                  return False
+              try:
+                  ns = get_ns_uri(ET.parse(path).getroot())
+                  return MULE_CORE_NS in ns or 'mulesoft.org/schema/mule' in ns
+              except:
+                  return False
+
+          def read_xml(path):
+              try:
+                  with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                      return f.read()
+              except:
+                  return ''
+
+          xml_files = []
+          seen_filenames = set()
+          for search_root in [
+              os.path.join(EXTRACT_DIR, 'META-INF', 'mule-src'),
+              EXTRACT_DIR,
+          ]:
+              if not os.path.exists(search_root):
+                  continue
+              for root, dirs, files in os.walk(search_root):
+                  dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+                  for f in sorted(files):
+                      if not f.endswith('.xml'):
+                          continue
+                      full = os.path.join(root, f)
+                      if f not in seen_filenames and is_mule_file(full):
+                          seen_filenames.add(f)
+                          xml_files.append((f, full))
+
+          print(f'Found {len(xml_files)} Mule XML file(s):')
+          for fname, fpath in xml_files:
+              print(f'  {fpath}')
+
+          SYSTEM_PROMPT = open('/tmp/claude_prompt.txt').read()
+
+          def call_claude(filename, xml_content):
+              print(f'  Calling Claude for: {filename} ({len(xml_content)} chars)...')
+              if len(xml_content) > 90000:
+                  xml_content = xml_content[:90000] + '\n<!-- TRUNCATED -->'
+              try:
+                  msg = client.messages.create(
+                      model='claude-sonnet-4-6',
+                      max_tokens=8000,
+                      system=SYSTEM_PROMPT,
+                      messages=[{
+                          'role': 'user',
+                          'content': f'Document ALL flows in this MuleSoft XML file named `{filename}`.\n\n{xml_content}'
+                      }]
+                  )
+                  return msg.content[0].text.strip()
+              except Exception as e:
+                  print(f'  API error for {filename}: {e}')
+                  return None
+
+          def parse_flow_blocks(response_text):
+              blocks = []
+              parts = re.split(r'===FLOW_START===', response_text)
+              for part in parts:
+                  part = part.strip()
+                  if '===FLOW_END===' not in part:
+                      continue
+                  content = part.split('===FLOW_END===')[0].strip()
+                  name_match = re.search(r'FLOW_NAME:\s*(.+)', content)
+                  type_match = re.search(r'FLOW_TYPE:\s*(.+)', content)
+                  name  = name_match.group(1).strip() if name_match else 'Unnamed Flow'
+                  ftype = type_match.group(1).strip() if type_match else 'flow'
+                  blocks.append({'name': name, 'type': ftype, 'raw': content})
+              return blocks
+
+          SECTION_NAMES = [
+              'OVERVIEW','FLOW DIAGRAM','TRIGGER','INPUTS',
+              'LOGIC STEPS','CONNECTORS USED','ERROR HANDLING',
+              'OUTPUTS','FLOW REFERENCES','CONFIGURATION PROPERTIES',
+          ]
+
+          def get_section(raw, section_name):
+              pattern = rf'{re.escape(section_name)}\s*\n(.*?)(?=\n(?:{"| ".join(re.escape(s) for s in SECTION_NAMES)})\s*\n|$)'
+              match = re.search(pattern, raw, re.DOTALL)
+              return match.group(1).strip() if match else ''
+
+          BLUE_DARK  = RGBColor(0x1F, 0x49, 0x7D)
+          BLUE_MID   = RGBColor(0x2E, 0x75, 0xB6)
+          BLUE_LIGHT = RGBColor(0x44, 0x72, 0xC4)
+          WHITE      = RGBColor(0xFF, 0xFF, 0xFF)
+          GREY       = RGBColor(0x55, 0x55, 0x55)
+          GREEN      = RGBColor(0x1E, 0x6B, 0x3A)
+          BLACK      = RGBColor(0x00, 0x00, 0x00)
+          CODE_BG    = 'F2F2F2'
+
+          def shade_cell(cell, hex_color):
+              tc = cell._tc
+              tcPr = tc.get_or_add_tcPr()
+              shd = OxmlElement('w:shd')
+              shd.set(qn('w:val'), 'clear')
+              shd.set(qn('w:color'), 'auto')
+              shd.set(qn('w:fill'), hex_color)
+              tcPr.append(shd)
+
+          def add_divider(doc):
+              p = doc.add_paragraph()
+              p.paragraph_format.space_before = Pt(2)
+              p.paragraph_format.space_after = Pt(4)
+              pPr = p._p.get_or_add_pPr()
+              pBd = OxmlElement('w:pBdr')
+              bt = OxmlElement('w:bottom')
+              bt.set(qn('w:val'), 'single')
+              bt.set(qn('w:sz'), '6')
+              bt.set(qn('w:space'), '1')
+              bt.set(qn('w:color'), '2E75B6')
+              pBd.append(bt)
+              pPr.append(pBd)
+
+          def add_kv(doc, key, value, indent=False):
+              p = doc.add_paragraph()
+              p.paragraph_format.space_after = Pt(2)
+              if indent:
+                  p.paragraph_format.left_indent = Inches(0.25)
+              r1 = p.add_run(f'{key}: ')
+              r1.bold = True
+              r1.font.color.rgb = BLUE_DARK
+              r2 = p.add_run(str(value) if value else '---')
+              r2.font.color.rgb = BLACK
+
+          def add_bullet(doc, text, indent=0.25, color=None):
+              p = doc.add_paragraph()
+              p.paragraph_format.left_indent = Inches(indent)
+              p.paragraph_format.space_after = Pt(2)
+              run = p.add_run('- ' + str(text))
+              run.font.size = Pt(10)
+              if color:
+                  run.font.color.rgb = color
+
+          def add_code_block(doc, code, indent=0.25):
+              for line in str(code).strip().split('\n'):
+                  p = doc.add_paragraph()
+                  p.paragraph_format.left_indent = Inches(indent)
+                  p.paragraph_format.space_before = Pt(0)
+                  p.paragraph_format.space_after = Pt(0)
+                  pPr = p._p.get_or_add_pPr()
+                  shd = OxmlElement('w:shd')
+                  shd.set(qn('w:val'), 'clear')
+                  shd.set(qn('w:color'), 'auto')
+                  shd.set(qn('w:fill'), CODE_BG)
+                  pPr.append(shd)
+                  run = p.add_run(line if line.strip() else ' ')
+                  run.font.name = 'Courier New'
+                  run.font.size = Pt(8)
+                  run.font.color.rgb = BLACK
+              doc.add_paragraph().paragraph_format.space_after = Pt(4)
+
+          def add_table_from_markdown(doc, md_table_text):
+              lines = [l.strip() for l in md_table_text.strip().split('\n')
+                       if l.strip() and not re.match(r'^\|[-| :]+\|$', l.strip())]
+              if not lines:
+                  return
+              rows = []
+              for line in lines:
+                  cells = [c.strip() for c in line.strip('|').split('|')]
+                  rows.append(cells)
+              if not rows:
+                  return
+              headers = rows[0]
+              data_rows = rows[1:]
+              num_cols = len(headers)
+              col_w = [6.3 / num_cols] * num_cols
+              tbl = doc.add_table(rows=1, cols=num_cols)
+              tbl.style = 'Table Grid'
+              hdr_cells = tbl.rows[0].cells
+              for i, h in enumerate(headers):
+                  hdr_cells[i].width = Inches(col_w[i])
+                  shade_cell(hdr_cells[i], '2E75B6')
+                  run = hdr_cells[i].paragraphs[0].add_run(h)
+                  run.bold = True
+                  run.font.color.rgb = WHITE
+                  run.font.size = Pt(10)
+              for ri, row_data in enumerate(data_rows):
+                  cells = tbl.add_row().cells
+                  fill = 'EBF3FB' if ri % 2 == 0 else 'FFFFFF'
+                  for i in range(num_cols):
+                      val = row_data[i] if i < len(row_data) else ''
+                      cells[i].width = Inches(col_w[i])
+                      shade_cell(cells[i], fill)
+                      run = cells[i].paragraphs[0].add_run(val)
+                      run.font.size = Pt(9)
+              doc.add_paragraph().paragraph_format.space_after = Pt(4)
+
+          def render_logic_steps(doc, steps_text):
+              if not steps_text.strip():
+                  doc.add_paragraph('').add_run('No logic steps found.').italic = True
+                  return
+              step_pattern = re.compile(
+                  r'^(STEP\s+[\w.]+:\s*.+?)(?=^STEP\s+[\w.]+:|\Z)',
+                  re.MULTILINE | re.DOTALL
+              )
+              step_blocks = step_pattern.findall(steps_text)
+              if not step_blocks:
+                  step_blocks = [steps_text]
+              for block in step_blocks:
+                  block = block.strip()
+                  if not block:
+                      continue
+                  lines = block.split('\n')
+                  first_line = lines[0].strip()
+                  step_match = re.match(r'STEP\s+([\w.]+):\s*(.+)', first_line, re.IGNORECASE)
+                  if step_match:
+                      step_num = step_match.group(1)
+                      comp_name = step_match.group(2).strip()
+                  else:
+                      step_num = '?'
+                      comp_name = first_line
+                  p = doc.add_paragraph()
+                  p.paragraph_format.space_after = Pt(2)
+                  p.paragraph_format.space_before = Pt(6)
+                  num_run = p.add_run(f'Step {step_num}  ')
+                  num_run.bold = True
+                  num_run.font.color.rgb = BLUE_MID
+                  num_run.font.size = Pt(11)
+                  comp_run = p.add_run(comp_name)
+                  comp_run.bold = True
+                  comp_run.font.size = Pt(11)
+                  comp_run.font.color.rgb = BLACK
+                  body = '\n'.join(lines[1:])
+                  desc_match = re.search(
+                      r'Description:\s*(.+?)(?=\nDataWeave:|\nSQL:|\nROUTE\s|\nSTEP\s|\Z)',
+                      body, re.DOTALL
+                  )
+                  if desc_match:
+                      dp = doc.add_paragraph()
+                      dp.paragraph_format.left_indent = Inches(0.3)
+                      dp.paragraph_format.space_after = Pt(2)
+                      dp.add_run(desc_match.group(1).strip()).font.size = Pt(10)
+                  for dw_label in ['DataWeave', 'SQL']:
+                      dw_match = re.search(
+                          rf'{dw_label}:\s*\n```[a-z]*\n(.*?)```',
+                          body, re.DOTALL
+                      )
+                      if dw_match and dw_match.group(1).strip():
+                          lp = doc.add_paragraph()
+                          lp.paragraph_format.left_indent = Inches(0.3)
+                          lp.paragraph_format.space_after = Pt(1)
+                          lr = lp.add_run(f'{dw_label} Script:')
+                          lr.italic = True
+                          lr.font.color.rgb = GREEN
+                          lr.font.size = Pt(9)
+                          add_code_block(doc, dw_match.group(1).strip(), indent=0.4)
+                  route_pattern = re.compile(
+                      r'^(\s*ROUTE\s+.+?)(?=^\s*ROUTE\s+|\Z)',
+                      re.MULTILINE | re.DOTALL
+                  )
+                  for rb in route_pattern.findall(body):
+                      rb = rb.strip()
+                      if not rb:
+                          continue
+                      route_label_match = re.match(r'ROUTE\s+(.+)', rb.split('\n')[0].strip())
+                      route_label = route_label_match.group(1).strip() if route_label_match else 'Route'
+                      rp = doc.add_paragraph()
+                      rp.paragraph_format.left_indent = Inches(0.35)
+                      rp.paragraph_format.space_after = Pt(1)
+                      rr = rp.add_run(f'Route: {route_label}')
+                      rr.bold = True
+                      rr.font.color.rgb = BLUE_LIGHT
+                      rr.font.size = Pt(10)
+                      inner_steps = re.compile(
+                          r'^(\s*STEP\s+[\w.]+:\s*.+?)(?=^\s*STEP\s+[\w.]+:|\Z)',
+                          re.MULTILINE | re.DOTALL
+                      ).findall(rb)
+                      for inner in inner_steps:
+                          inner = inner.strip()
+                          inner_lines = inner.split('\n')
+                          inner_first = inner_lines[0].strip()
+                          im = re.match(r'STEP\s+([\w.]+):\s*(.+)', inner_first, re.IGNORECASE)
+                          if im:
+                              in_num = im.group(1)
+                              in_comp = im.group(2).strip()
+                          else:
+                              in_num = '?'
+                              in_comp = inner_first
+                          ip = doc.add_paragraph()
+                          ip.paragraph_format.left_indent = Inches(0.5)
+                          ip.paragraph_format.space_after = Pt(1)
+                          ir1 = ip.add_run(f'Step {in_num}  ')
+                          ir1.bold = True
+                          ir1.font.color.rgb = BLUE_MID
+                          ir1.font.size = Pt(10)
+                          ir2 = ip.add_run(in_comp)
+                          ir2.bold = True
+                          ir2.font.size = Pt(10)
+                          ir2.font.color.rgb = BLACK
+                          inner_body = '\n'.join(inner_lines[1:])
+                          id_match = re.search(
+                              r'Description:\s*(.+?)(?=\nDataWeave:|\nSQL:|\nSTEP\s|\Z)',
+                              inner_body, re.DOTALL
+                          )
+                          if id_match:
+                              idp = doc.add_paragraph()
+                              idp.paragraph_format.left_indent = Inches(0.65)
+                              idp.paragraph_format.space_after = Pt(1)
+                              idp.add_run(id_match.group(1).strip()).font.size = Pt(9)
+                          for dw_label in ['DataWeave', 'SQL']:
+                              idw = re.search(
+                                  rf'{dw_label}:\s*\n```[a-z]*\n(.*?)```',
+                                  inner_body, re.DOTALL
+                              )
+                              if idw and idw.group(1).strip():
+                                  ilp = doc.add_paragraph()
+                                  ilp.paragraph_format.left_indent = Inches(0.65)
+                                  ilp.paragraph_format.space_after = Pt(1)
+                                  ilr = ilp.add_run(f'{dw_label} Script:')
+                                  ilr.italic = True
+                                  ilr.font.color.rgb = GREEN
+                                  ilr.font.size = Pt(9)
+                                  add_code_block(doc, idw.group(1).strip(), indent=0.75)
+                  sep = doc.add_paragraph()
+                  sep.paragraph_format.space_after = Pt(3)
+
+          def render_flow(doc, block, filename):
+              name  = block['name']
+              ftype = block['type']
+              raw   = block['raw']
+              doc.add_heading(f'Flow: {name}', level=2)
+              add_kv(doc, 'Source File', filename)
+              add_kv(doc, 'Flow Type', ftype)
+              doc.add_paragraph()
+              overview = get_section(raw, 'OVERVIEW')
+              if overview:
+                  doc.add_heading('Overview', level=3)
+                  p = doc.add_paragraph(overview)
+                  p.paragraph_format.space_after = Pt(6)
+              diagram = get_section(raw, 'FLOW DIAGRAM')
+              if diagram:
+                  doc.add_heading('Flow Diagram', level=3)
+                  note_p = doc.add_paragraph()
+                  note_r = note_p.add_run('Mermaid diagram - paste into https://mermaid.live to render visually')
+                  note_r.italic = True
+                  note_r.font.size = Pt(9)
+                  note_r.font.color.rgb = GREY
+                  diagram_clean = re.sub(r'^```[a-z]*\n?', '', diagram.strip())
+                  diagram_clean = re.sub(r'\n?```$', '', diagram_clean).strip()
+                  add_code_block(doc, '```mermaid\n' + diagram_clean + '\n```', indent=0.2)
+              trigger = get_section(raw, 'TRIGGER')
+              if trigger:
+                  doc.add_heading('Trigger', level=3)
+                  for line in trigger.strip().split('\n'):
+                      line = line.strip().lstrip('-').strip()
+                      if ':' in line:
+                          k, _, v = line.partition(':')
+                          v = v.strip()
+                          if v and v.lower() not in ('n/a','none','omit',''):
+                              add_kv(doc, k.strip(), v, indent=True)
+                  doc.add_paragraph()
+              inputs = get_section(raw, 'INPUTS')
+              if inputs:
+                  doc.add_heading('Inputs', level=3)
+                  for line in inputs.strip().split('\n'):
+                      line = line.strip().lstrip('-').strip()
+                      if line:
+                          add_bullet(doc, line)
+                  doc.add_paragraph()
+              logic = get_section(raw, 'LOGIC STEPS')
+              doc.add_heading('Logic Steps', level=3)
+              intro = doc.add_paragraph()
+              intro.add_run(
+                  'Each step is documented below. DataWeave scripts and SQL queries '
+                  'are shown inline immediately beneath the step they belong to.'
+              ).italic = True
+              intro.paragraph_format.space_after = Pt(4)
+              render_logic_steps(doc, logic)
+              doc.add_paragraph()
+              connectors = get_section(raw, 'CONNECTORS USED')
+              doc.add_heading('Connectors & Components Used', level=3)
+              if '|' in connectors:
+                  add_table_from_markdown(doc, connectors)
+              else:
+                  for line in connectors.strip().split('\n'):
+                      line = line.strip().lstrip('-').strip()
+                      if line:
+                          add_bullet(doc, line)
+              doc.add_paragraph()
+              error = get_section(raw, 'ERROR HANDLING')
+              if error:
+                  doc.add_heading('Error Handling', level=3)
+                  for line in error.strip().split('\n'):
+                      line = line.strip().lstrip('-').strip()
+                      if ':' in line:
+                          k, _, v = line.partition(':')
+                          if v.strip():
+                              add_kv(doc, k.strip(), v.strip(), indent=True)
+                      elif line:
+                          add_bullet(doc, line)
+                  doc.add_paragraph()
+              outputs = get_section(raw, 'OUTPUTS')
+              if outputs:
+                  doc.add_heading('Outputs', level=3)
+                  for line in outputs.strip().split('\n'):
+                      line = line.strip().lstrip('-').strip()
+                      if ':' in line:
+                          k, _, v = line.partition(':')
+                          add_kv(doc, k.strip(), v.strip(), indent=True)
+                      elif line:
+                          add_bullet(doc, line)
+              refs = get_section(raw, 'FLOW REFERENCES')
+              doc.add_heading('Flow References', level=3)
+              if refs and refs.strip().lower() not in ('none',''):
+                  for line in refs.strip().split('\n'):
+                      line = line.strip().lstrip('-').strip()
+                      if line:
+                          add_bullet(doc, line)
+              else:
+                  doc.add_paragraph('').add_run('None').italic = True
+              props = get_section(raw, 'CONFIGURATION PROPERTIES')
+              doc.add_heading('Configuration Properties Used', level=3)
+              if props and props.strip().lower() not in ('none',''):
+                  for line in props.strip().split('\n'):
+                      line = line.strip().lstrip('-').strip()
+                      if line:
+                          add_bullet(doc, line)
+              else:
+                  doc.add_paragraph('').add_run('None').italic = True
+              add_divider(doc)
+              doc.add_paragraph()
+
+          all_results = []
+          for fname, fpath in xml_files:
+              xml_content = read_xml(fpath)
+              if not xml_content:
+                  print(f'  Skipping empty: {fname}')
+                  continue
+              response = call_claude(fname, xml_content)
+              if response:
+                  blocks = parse_flow_blocks(response)
+                  print(f'  Parsed {len(blocks)} flow(s) from {fname}')
+                  all_results.append((fname, blocks))
+              time.sleep(1)
+
+          total_flows = sum(len(b) for _, b in all_results)
+          print(f'Total flows documented: {total_flows}')
+
+          doc = Document()
+          cp = doc.add_paragraph()
+          cp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+          cr = cp.add_run('MuleSoft Flow Documentation')
+          cr.bold = True
+          cr.font.size = Pt(28)
+          cr.font.color.rgb = BLUE_DARK
+          doc.add_paragraph()
+          sp = doc.add_paragraph()
+          sp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+          sr = sp.add_run(f'Generated from: {JAR_NAME}')
+          sr.font.size = Pt(14)
+          sr.font.color.rgb = BLUE_LIGHT
+          doc.add_paragraph()
+          mp = doc.add_paragraph()
+          mp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+          mr = mp.add_run(f'Date: {TODAY}  |  Branch: {GITHUB_REF}  |  Commit: {GITHUB_SHA}')
+          mr.font.size = Pt(10)
+          mr.font.color.rgb = GREY
+          doc.add_paragraph()
+          np = doc.add_paragraph()
+          np.alignment = WD_ALIGN_PARAGRAPH.CENTER
+          nr = np.add_run('Generated by Claude AI (claude-sonnet-4-6)')
+          nr.font.size = Pt(10)
+          nr.font.color.rgb = GREY
+          doc.add_page_break()
+          doc.add_heading('Summary', level=1)
+          add_kv(doc, 'JAR File', JAR_NAME)
+          add_kv(doc, 'Date', TODAY)
+          add_kv(doc, 'Branch/Commit', f'{GITHUB_REF} / {GITHUB_SHA}')
+          add_kv(doc, 'Files Documented', str(len(all_results)))
+          add_kv(doc, 'Total Flows', str(total_flows))
+          doc.add_paragraph()
+          p = doc.add_paragraph(
+              f'This document covers {len(all_results)} Mule XML file(s) and '
+              f'{total_flows} flow(s) extracted from {JAR_NAME}. '
+              f'Each flow section contains: overview, Mermaid flow diagram, trigger, '
+              f'inputs, logic steps with inline DataWeave scripts, connectors used, '
+              f'error handling, outputs, flow references, and configuration properties. '
+              f'Documentation generated by Claude AI.'
+          )
+          p.paragraph_format.space_after = Pt(8)
+          add_divider(doc)
+          doc.add_page_break()
+          if not all_results:
+              doc.add_paragraph('No Mule XML flow files were found or could be documented.')
+          else:
+              for fname, blocks in all_results:
+                  doc.add_heading(f'File: {fname}', level=1)
+                  if not blocks:
+                      doc.add_paragraph(
+                          'This file contains Mule global configurations only - no flows defined.'
+                      ).italic = True
+                      add_divider(doc)
+                      doc.add_paragraph()
+                      continue
+                  for block in blocks:
+                      render_flow(doc, block, fname)
+                      doc.add_page_break()
+          doc.save(DOC_NAME)
+          print(f'Saved: {DOC_NAME}')
+          SCRIPTEOF
+
+      - name: Write Claude prompt file
+        run: |
+          cat > /tmp/claude_prompt.txt << 'PROMPTEOF'
+          You are a senior MuleSoft integration architect and technical writer.
+          You will receive the raw XML of a MuleSoft flow file.
+          Your job is to produce clear, detailed, human-readable documentation for EVERY flow and sub-flow in the file.
+
+          OUTPUT FORMAT - use these exact section markers so the code can split your response per flow:
+
+          ===FLOW_START===
+          FLOW_NAME: <exact flow name from XML>
+          FLOW_TYPE: <flow or sub-flow>
+
+          OVERVIEW
+          <Write 3-5 sentences in plain English explaining what this flow does, why it exists,
+          what triggers it, and what the end result is. A business analyst should understand this.>
+
+          FLOW DIAGRAM
+          <Write a valid Mermaid graph TD diagram that accurately shows every step in this flow.
+          Rules for the diagram:
+          - Use --> for arrows between steps
+          - Use [] for normal steps: A[HTTP Listener: /path]
+          - Use {} for decision points: B{Choice Router}
+          - Use ([]) for merge/end points: C([Merge Results])
+          - Show all parallel routes for Scatter-Gather
+          - Show all branches for Choice router
+          - Show inner steps for Try scopes
+          - Show error handler branches with -->|error| notation
+          - Keep node labels short but meaningful (max 50 chars)
+          Example:
+          graph TD
+              A[HTTP Listener: /api/orders] --> B[Set Variable: orderId]
+              B --> C{Choice Router}
+              C -->|orderId exists| D[DB Select: fetch order]
+              C -->|otherwise| E[Set Payload: error]
+              D --> F[Transform: map to JSON]
+              E --> F
+              F --> G([HTTP Response])>
+
+          TRIGGER
+          - Type: <HTTP Listener / Scheduler / File Listener / JMS Listener / VM Listener / None>
+          - Path: <path if HTTP>
+          - Method: <GET/POST/ANY if HTTP>
+          - Schedule: <frequency and timeUnit if Scheduler>
+          - Directory: <directory if File Listener>
+          - Watermark Mode: <watermark mode if File Listener>
+          - Destination: <queue or topic if JMS/VM>
+          - Config Ref: <config-ref value>
+
+          INPUTS
+          - <describe each input: payload shape, headers, query params, variables expected>
+
+          LOGIC STEPS
+          STEP 1: <Component Name>
+          Description: <2-4 sentences explaining what this step does in plain English.
+          Explain the business purpose not just the technical action.
+          For HTTP requests mention the URL method and what data is sent or received.
+          For DB operations mention the table operation and what data is affected.
+          For transforms explain what the input looks like and what the output looks like.
+          For routers explain each condition and what happens in each branch.>
+          DataWeave:
+          ```
+          <paste the COMPLETE verbatim script here - do not summarize or truncate>
+          ```
+          <If no DataWeave skip the DataWeave block entirely>
+          <If this step is a Scatter-Gather, Choice, Try or ForEach expand its inner steps:>
+          ROUTE <name or condition>:
+            STEP A: <inner component>
+            Description: <description>
+            DataWeave:
+            ```
+            <script if any>
+            ```
+
+          CONNECTORS USED
+          | Connector | Operation | Config Ref | Key Details |
+          |-----------|-----------|------------|-------------|
+          <one row per unique connector or component used>
+
+          ERROR HANDLING
+          - Strategy: <on-error-propagate / on-error-continue / None>
+          - Error Types: <types caught or None>
+          - Behaviour: <plain English description of what happens on error>
+
+          OUTPUTS
+          - Payload: <describe the final payload shape type and content>
+          - Variables Set: <list all variables set during this flow or None>
+
+          FLOW REFERENCES
+          <list any sub-flows called via flow-ref or write None>
+
+          CONFIGURATION PROPERTIES
+          <list any property references used or write None>
+          ===FLOW_END===
+
+          CRITICAL RULES:
+          1. Write ONE ===FLOW_START=== to ===FLOW_END=== block for EVERY flow and sub-flow.
+          2. DataWeave scripts must be COMPLETE and VERBATIM - never summarize them.
+          3. The Mermaid diagram must accurately reflect the real flow structure.
+          4. Every step must have a Description - never skip it.
+          5. Use plain English that a non-developer can understand.
+          6. Do NOT write anything outside the ===FLOW_START=== and ===FLOW_END=== markers.
+          PROMPTEOF
+
+      - name: Run documentation generator
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          EXTRACT_DIR: ${{ env.EXTRACT_DIR }}
+          JAR_NAME: ${{ env.JAR_NAME }}
+        run: python3 /tmp/generate_docs.py
+
+      - name: Commit documentation
+        run: |
+          JAR_BASE="${{ github.event.inputs.jar_file }}"
+          DOC_NAME="${JAR_BASE%.jar}-flow-documentation.docx"
+          BRANCH="docs/${JAR_BASE%.jar}"
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git checkout -b "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
+          git add "${{ env.EXTRACT_DIR }}/" "$DOC_NAME"
+          git commit -m "docs: Claude-generated flow documentation for ${{ github.event.inputs.jar_file }}"
+          git push origin "$BRANCH"
