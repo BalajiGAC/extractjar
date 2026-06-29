@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:db="http://www.mulesoft.org/schema/mule/db" xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:twilio="http://www.mulesoft.org/schema/mule/twilio"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http" xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/twilio http://www.mulesoft.org/schema/mule/twilio/current/mule-twilio.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd">
+	<http:listener-config name="HTTP_Listener_config" doc:name="HTTP Listener config" doc:id="b77a918e-e441-4af8-abf0-56615451a5cd" >
+		<http:listener-connection host="0.0.0.0" port="8081" />
+	</http:listener-config>
+	<twilio:config name="Twilio_Connector_Config" doc:name="Twilio Connector Config" doc:id="4c9e8d15-7b9d-42c0-b574-c29725f404b3" >
+		<twilio:account-sid-auth-token-connection username="AC083d9a8fba1273860359f5c3fb463743" password="b4b82aa95a7b0bedfb16d419bd429ba4" />
+	</twilio:config>
+	<db:config name="Database_Config" doc:name="Database Config" doc:id="7894bb6f-32a2-4da2-b13d-8d956dc732bf" >
+		<db:my-sql-connection host="localhost" port="3306" user="root" password="Welcome@123" database="mule4" />
+	</db:config>
+	<flow name="twilio-projectFlow" doc:id="64a90241-0db0-4a42-964a-bd7e420f2d53" >
+		<http:listener doc:name="Listener  GET /sendsms" doc:id="e9b2e9b5-5165-4bfe-82b0-c4a527d72ed8" config-ref="HTTP_Listener_config" path="sendsms"/>
+		<set-variable value="#[payload.phoneno]" doc:name="Set Variable" doc:id="f926b170-2618-4f04-aaf9-fb7d58def3b0" variableName="phoneno" />
+		<db:query-single doc:name="Query single" doc:id="c1a104d9-d6cb-4c6b-8df2-c0c8ace24620" config-ref="Database_Config">
+			<db:sql ><![CDATA[select orderid, msg from po_order where orderid =:id]]></db:sql>
+			<db:input-parameters ><![CDATA[#[{id: payload.ordid}]]]></db:input-parameters>
+		</db:query-single>
+		<ee:transform doc:name="Transform Message" doc:id="a5838e56-20ef-4a88-aa7a-f646359a25e7" >
+			<ee:message >
+				<ee:set-payload ><![CDATA[%dw 2.0
+output application/x-www-form-urlencoded
+---
+{
+	From: "+16673031410",
+	To: vars.phoneno,
+	Body: payload.orderid++" "++ payload.msg
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+		<twilio:create20100401-accounts-messagesjson-by-account-sid doc:name="Create Message" doc:id="8bcb2ac7-ee9b-4a2e-960c-7951729977b8" config-ref="Twilio_Connector_Config" accountSid="AC083d9a8fba1273860359f5c3fb463743"/>
+		<ee:transform doc:name="Transform Message" doc:id="1448d5c7-6475-4de7-a59b-aadc8f430508" >
+			<ee:message >
+				<ee:set-payload ><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</flow>
+</mule>
