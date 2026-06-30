@@ -59,7 +59,29 @@ jobs:
           GITHUB_REF  = os.environ.get('GITHUB_REF_NAME', 'N/A')
           GITHUB_SHA  = os.environ.get('GITHUB_SHA', 'N/A')[:8]
           DOC_NAME    = JAR_NAME.replace('.jar', '') + '-flow-documentation.docx'
-          client      = anthropic.Anthropic(api_key=os.environ.get('ANTHROPIC_API_KEY'))
+          # ── Safe API key diagnostic — never prints the actual key ──
+          _raw_key = os.environ.get('ANTHROPIC_API_KEY', '')
+          _key     = _raw_key.strip()
+          print('=' * 70)
+          print('API KEY DIAGNOSTIC')
+          print(f'  key present          : {bool(_key)}')
+          print(f'  key length           : {len(_key)}')
+          print(f'  key had whitespace   : {_raw_key != _key}')
+          print(f'  starts with sk-ant-  : {_key.startswith("sk-ant-")}')
+          print(f'  first 10 chars       : {_key[:10] if _key else "(empty)"}...')
+          print('=' * 70)
+          if not _key:
+              raise SystemExit(
+                  'FATAL: ANTHROPIC_API_KEY is empty. Check that the secret is set '
+                  'as a Repository secret (not Environment secret unless this job '
+                  'declares environment:), and that the workflow step passes it via env:.'
+              )
+          if not _key.startswith('sk-ant-'):
+              print('WARNING: key does not start with expected "sk-ant-" prefix. '
+                    'Double check you copied the full key from console.anthropic.com '
+                    'with no truncation or extra characters.')
+
+          client       = anthropic.Anthropic(x-api-key=_key)
           MULE_CORE_NS = 'http://www.mulesoft.org/schema/mule/core'
 
           def read_xml(path):
@@ -125,6 +147,17 @@ jobs:
                       }]
                   )
                   return msg.content[0].text.strip()
+              except anthropic.AuthenticationError as e:
+                  print('=' * 70)
+                  print(f'  AUTHENTICATION ERROR for {filename}: {e}')
+                  print('  This means the API key was rejected by Anthropic.')
+                  print('  Most likely causes:')
+                  print('    1. Secret value has a typo, truncation, or extra whitespace')
+                  print('    2. Secret is an Environment secret but job has no environment: set')
+                  print('    3. Key was revoked/rotated in console.anthropic.com')
+                  print('    4. Wrong secret name referenced in workflow env: block')
+                  print('=' * 70)
+                  raise SystemExit(1)
               except Exception as e:
                   print(f'  API error for {filename}: {e}')
                   return None
