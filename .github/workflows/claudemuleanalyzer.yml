@@ -75,13 +75,42 @@ jobs:
               return el.tag.split('}')[0].strip('{') if '}' in el.tag else ''
 
           def is_mule_file(path):
-              if os.path.basename(path) in NON_MULE_FILENAMES:
+              """
+              Returns True if this XML file is a MuleSoft flow/config file.
+              Strategy:
+                1. Reject known non-Mule filenames outright.
+                2. Try strict XML parse and check root namespace / tag.
+                3. Fallback: raw text search for mulesoft namespace strings
+                   anywhere in the file (covers cases where strict parsing
+                   fails due to encoding, BOM, or unusual XML declarations).
+              """
+              fname = os.path.basename(path)
+              if fname in NON_MULE_FILENAMES:
                   return False
+
+              # Strategy 1 — proper XML parse
               try:
-                  ns = get_ns_uri(ET.parse(path).getroot())
-                  return MULE_CORE_NS in ns or 'mulesoft.org/schema/mule' in ns
-              except:
-                  return False
+                  root = ET.parse(path).getroot()
+                  tag  = root.tag
+                  ns   = get_ns_uri(root)
+                  if MULE_CORE_NS in ns or 'mulesoft.org/schema/mule' in ns:
+                      return True
+                  # Root tag itself might just be 'mule' with no namespace prefix
+                  if tag.split('}')[-1] == 'mule':
+                      return True
+              except Exception as e:
+                  print(f'  [parse warning] {path}: {e}')
+
+              # Strategy 2 — raw text fallback (covers edge cases above)
+              try:
+                  with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                      head = f.read(3000)
+                  if 'mulesoft.org/schema/mule' in head or '<mule ' in head or '<mule>' in head:
+                      return True
+              except Exception as e:
+                  print(f'  [text-scan warning] {path}: {e}')
+
+              return False
 
           def read_xml(path):
               try:
@@ -90,25 +119,39 @@ jobs:
               except:
                   return ''
 
-          xml_files = []
-          seen_filenames = set()
+          # Debug — list every XML file found before filtering, so we can see
+          # in the Actions log exactly what was scanned and why it was rejected.
+          print('--- Scanning for XML files ---')
+          all_xml_seen = []
           for search_root in [
               os.path.join(EXTRACT_DIR, 'META-INF', 'mule-src'),
               EXTRACT_DIR,
           ]:
               if not os.path.exists(search_root):
+                  print(f'  search root does not exist: {search_root}')
                   continue
+              print(f'  scanning: {search_root}')
               for root, dirs, files in os.walk(search_root):
                   dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
                   for f in sorted(files):
-                      if not f.endswith('.xml'):
-                          continue
-                      full = os.path.join(root, f)
-                      if f not in seen_filenames and is_mule_file(full):
-                          seen_filenames.add(f)
-                          xml_files.append((f, full))
+                      if f.endswith('.xml'):
+                          full = os.path.join(root, f)
+                          all_xml_seen.append(full)
 
-          print(f'Found {len(xml_files)} Mule XML file(s):')
+          print(f'  total .xml files seen (before filtering): {len(all_xml_seen)}')
+          for p in all_xml_seen:
+              verdict = is_mule_file(p)
+              print(f'    [{"KEEP" if verdict else "skip"}] {p}')
+
+          xml_files = []
+          seen_filenames = set()
+          for full in all_xml_seen:
+              f = os.path.basename(full)
+              if f not in seen_filenames and is_mule_file(full):
+                  seen_filenames.add(f)
+                  xml_files.append((f, full))
+
+          print(f'Found {len(xml_files)} Mule XML file(s) to document:')
           for fname, fpath in xml_files:
               print(f'  {fpath}')
 
