@@ -62,56 +62,6 @@ jobs:
           client      = anthropic.Anthropic(api_key=os.environ.get('ANTHROPIC_API_KEY'))
           MULE_CORE_NS = 'http://www.mulesoft.org/schema/mule/core'
 
-          NON_MULE_FILENAMES = {
-              'pom.xml','log4j2.xml','log4j.xml','application-types.xml',
-              'beans.xml','web.xml','context.xml','persistence.xml',
-          }
-          SKIP_DIRS = {
-              '.mule','.settings','cache','offheap-disk-store',
-              'test','munit','java','api','wsdl','xsd','repository',
-          }
-
-          def get_ns_uri(el):
-              return el.tag.split('}')[0].strip('{') if '}' in el.tag else ''
-
-          def is_mule_file(path):
-              """
-              Returns True if this XML file is a MuleSoft flow/config file.
-              Strategy:
-                1. Reject known non-Mule filenames outright.
-                2. Try strict XML parse and check root namespace / tag.
-                3. Fallback: raw text search for mulesoft namespace strings
-                   anywhere in the file (covers cases where strict parsing
-                   fails due to encoding, BOM, or unusual XML declarations).
-              """
-              fname = os.path.basename(path)
-              if fname in NON_MULE_FILENAMES:
-                  return False
-
-              # Strategy 1 — proper XML parse
-              try:
-                  root = ET.parse(path).getroot()
-                  tag  = root.tag
-                  ns   = get_ns_uri(root)
-                  if MULE_CORE_NS in ns or 'mulesoft.org/schema/mule' in ns:
-                      return True
-                  # Root tag itself might just be 'mule' with no namespace prefix
-                  if tag.split('}')[-1] == 'mule':
-                      return True
-              except Exception as e:
-                  print(f'  [parse warning] {path}: {e}')
-
-              # Strategy 2 — raw text fallback (covers edge cases above)
-              try:
-                  with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-                      head = f.read(3000)
-                  if 'mulesoft.org/schema/mule' in head or '<mule ' in head or '<mule>' in head:
-                      return True
-              except Exception as e:
-                  print(f'  [text-scan warning] {path}: {e}')
-
-              return False
-
           def read_xml(path):
               try:
                   with open(path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -119,41 +69,44 @@ jobs:
               except:
                   return ''
 
-          # Debug — list every XML file found before filtering, so we can see
-          # in the Actions log exactly what was scanned and why it was rejected.
-          print('--- Scanning for XML files ---')
-          all_xml_seen = []
-          for search_root in [
-              os.path.join(EXTRACT_DIR, 'META-INF', 'mule-src'),
-              EXTRACT_DIR,
-          ]:
-              if not os.path.exists(search_root):
-                  print(f'  search root does not exist: {search_root}')
-                  continue
-              print(f'  scanning: {search_root}')
-              for root, dirs, files in os.walk(search_root):
-                  dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
-                  for f in sorted(files):
-                      if f.endswith('.xml'):
-                          full = os.path.join(root, f)
-                          all_xml_seen.append(full)
+          # ── Full diagnostic dump — show absolutely everything on disk ──
+          print('=' * 70)
+          print(f'EXTRACT_DIR env var = {EXTRACT_DIR!r}')
+          print(f'EXTRACT_DIR exists  = {os.path.exists(EXTRACT_DIR)}')
+          print(f'Current working dir = {os.getcwd()}')
+          print(f'Contents of cwd     = {os.listdir(".")}')
+          print('=' * 70)
 
-          print(f'  total .xml files seen (before filtering): {len(all_xml_seen)}')
-          for p in all_xml_seen:
-              verdict = is_mule_file(p)
-              print(f'    [{"KEEP" if verdict else "skip"}] {p}')
+          if os.path.exists(EXTRACT_DIR):
+              print(f'--- Full file tree under {EXTRACT_DIR} ---')
+              for root, dirs, files in os.walk(EXTRACT_DIR):
+                  for f in files:
+                      print(f'  {os.path.join(root, f)}')
+          else:
+              print(f'!!! EXTRACT_DIR does not exist: {EXTRACT_DIR}')
 
+          # ── Collect every .xml file anywhere under EXTRACT_DIR ──
+          # No filtering, no namespace checks, no skipped directories.
+          # Every single .xml file found will be sent to Claude.
           xml_files = []
           seen_filenames = set()
-          for full in all_xml_seen:
-              f = os.path.basename(full)
-              if f not in seen_filenames and is_mule_file(full):
-                  seen_filenames.add(f)
-                  xml_files.append((f, full))
 
-          print(f'Found {len(xml_files)} Mule XML file(s) to document:')
+          if os.path.exists(EXTRACT_DIR):
+              for root, dirs, files in os.walk(EXTRACT_DIR):
+                  for f in sorted(files):
+                      if f.lower().endswith('.xml'):
+                          full = os.path.join(root, f)
+                          # De-dupe by filename, keep first occurrence
+                          if f not in seen_filenames:
+                              seen_filenames.add(f)
+                              xml_files.append((f, full))
+
+          print('=' * 70)
+          print(f'Total .xml files included for documentation: {len(xml_files)}')
           for fname, fpath in xml_files:
-              print(f'  {fpath}')
+              size = os.path.getsize(fpath) if os.path.exists(fpath) else 0
+              print(f'  {fpath}  ({size} bytes)')
+          print('=' * 70)
 
           SYSTEM_PROMPT = open('/tmp/claude_prompt.txt').read()
 
