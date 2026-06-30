@@ -59,29 +59,30 @@ jobs:
           GITHUB_REF  = os.environ.get('GITHUB_REF_NAME', 'N/A')
           GITHUB_SHA  = os.environ.get('GITHUB_SHA', 'N/A')[:8]
           DOC_NAME    = JAR_NAME.replace('.jar', '') + '-flow-documentation.docx'
-          client      = anthropic.Anthropic(api_key=os.environ.get('ANTHROPIC_API_KEY'))
+          # ── Safe API key diagnostic — never prints the actual key ──
+          _raw_key = os.environ.get('ANTHROPIC_API_KEY', '')
+          _key     = _raw_key.strip()
+          print('=' * 70)
+          print('API KEY DIAGNOSTIC')
+          print(f'  key present          : {bool(_key)}')
+          print(f'  key length           : {len(_key)}')
+          print(f'  key had whitespace   : {_raw_key != _key}')
+          print(f'  starts with sk-ant-  : {_key.startswith("sk-ant-")}')
+          print(f'  first 10 chars       : {_key[:10] if _key else "(empty)"}...')
+          print('=' * 70)
+          if not _key:
+              raise SystemExit(
+                  'FATAL: ANTHROPIC_API_KEY is empty. Check that the secret is set '
+                  'as a Repository secret (not Environment secret unless this job '
+                  'declares environment:), and that the workflow step passes it via env:.'
+              )
+          if not _key.startswith('sk-ant-'):
+              print('WARNING: key does not start with expected "sk-ant-" prefix. '
+                    'Double check you copied the full key from console.anthropic.com '
+                    'with no truncation or extra characters.')
+
+          client       = anthropic.Anthropic(api_key=_key)
           MULE_CORE_NS = 'http://www.mulesoft.org/schema/mule/core'
-
-          NON_MULE_FILENAMES = {
-              'pom.xml','log4j2.xml','log4j.xml','application-types.xml',
-              'beans.xml','web.xml','context.xml','persistence.xml',
-          }
-          SKIP_DIRS = {
-              '.mule','.settings','cache','offheap-disk-store',
-              'test','munit','java','api','wsdl','xsd','repository',
-          }
-
-          def get_ns_uri(el):
-              return el.tag.split('}')[0].strip('{') if '}' in el.tag else ''
-
-          def is_mule_file(path):
-              if os.path.basename(path) in NON_MULE_FILENAMES:
-                  return False
-              try:
-                  ns = get_ns_uri(ET.parse(path).getroot())
-                  return MULE_CORE_NS in ns or 'mulesoft.org/schema/mule' in ns
-              except:
-                  return False
 
           def read_xml(path):
               try:
@@ -90,27 +91,44 @@ jobs:
               except:
                   return ''
 
+          # ── Full diagnostic dump — show absolutely everything on disk ──
+          print('=' * 70)
+          print(f'EXTRACT_DIR env var = {EXTRACT_DIR!r}')
+          print(f'EXTRACT_DIR exists  = {os.path.exists(EXTRACT_DIR)}')
+          print(f'Current working dir = {os.getcwd()}')
+          print(f'Contents of cwd     = {os.listdir(".")}')
+          print('=' * 70)
+
+          if os.path.exists(EXTRACT_DIR):
+              print(f'--- Full file tree under {EXTRACT_DIR} ---')
+              for root, dirs, files in os.walk(EXTRACT_DIR):
+                  for f in files:
+                      print(f'  {os.path.join(root, f)}')
+          else:
+              print(f'!!! EXTRACT_DIR does not exist: {EXTRACT_DIR}')
+
+          # ── Collect every .xml file anywhere under EXTRACT_DIR ──
+          # No filtering, no namespace checks, no skipped directories.
+          # Every single .xml file found will be sent to Claude.
           xml_files = []
           seen_filenames = set()
-          for search_root in [
-              os.path.join(EXTRACT_DIR, 'META-INF', 'mule-src'),
-              EXTRACT_DIR,
-          ]:
-              if not os.path.exists(search_root):
-                  continue
-              for root, dirs, files in os.walk(search_root):
-                  dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
-                  for f in sorted(files):
-                      if not f.endswith('.xml'):
-                          continue
-                      full = os.path.join(root, f)
-                      if f not in seen_filenames and is_mule_file(full):
-                          seen_filenames.add(f)
-                          xml_files.append((f, full))
 
-          print(f'Found {len(xml_files)} Mule XML file(s):')
+          if os.path.exists(EXTRACT_DIR):
+              for root, dirs, files in os.walk(EXTRACT_DIR):
+                  for f in sorted(files):
+                      if f.lower().endswith('.xml'):
+                          full = os.path.join(root, f)
+                          # De-dupe by filename, keep first occurrence
+                          if f not in seen_filenames:
+                              seen_filenames.add(f)
+                              xml_files.append((f, full))
+
+          print('=' * 70)
+          print(f'Total .xml files included for documentation: {len(xml_files)}')
           for fname, fpath in xml_files:
-              print(f'  {fpath}')
+              size = os.path.getsize(fpath) if os.path.exists(fpath) else 0
+              print(f'  {fpath}  ({size} bytes)')
+          print('=' * 70)
 
           SYSTEM_PROMPT = open('/tmp/claude_prompt.txt').read()
 
@@ -129,6 +147,17 @@ jobs:
                       }]
                   )
                   return msg.content[0].text.strip()
+              except anthropic.AuthenticationError as e:
+                  print('=' * 70)
+                  print(f'  AUTHENTICATION ERROR for {filename}: {e}')
+                  print('  This means the API key was rejected by Anthropic.')
+                  print('  Most likely causes:')
+                  print('    1. Secret value has a typo, truncation, or extra whitespace')
+                  print('    2. Secret is an Environment secret but job has no environment: set')
+                  print('    3. Key was revoked/rotated in console.anthropic.com')
+                  print('    4. Wrong secret name referenced in workflow env: block')
+                  print('=' * 70)
+                  raise SystemExit(1)
               except Exception as e:
                   print(f'  API error for {filename}: {e}')
                   return None
