@@ -81,7 +81,7 @@ jobs:
                     'Double check you copied the full key from console.anthropic.com '
                     'with no truncation or extra characters.')
 
-          client       = anthropic.Anthropic(x-api-key=_key)
+          client       = anthropic.Anthropic(api_key=_key)
           MULE_CORE_NS = 'http://www.mulesoft.org/schema/mule/core'
 
           def read_xml(path):
