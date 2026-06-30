@@ -1,4 +1,4 @@
-name: MuleSoft JAR Documentation Generator
+name: (TEST) MuleSoft JAR Documentation Generator
 
 on:
   workflow_dispatch:
