@@ -1,4 +1,4 @@
-name: MCP Documentation Generator
+name: MuleSoft MCP Documentation Generator
 
 on:
   workflow_dispatch:
@@ -129,15 +129,102 @@ jobs:
           #   ]
           # }
           # ─────────────────────────────────────────────────────────────
-          def call_mcp(jar_name, files):
-              # Token is already embedded in MCP_URL as ?wkt_token=...
-              # No Authorization header needed — Workato authenticates via URL param
+          def mcp_request(method, params=None):
+              """Send a standard MCP protocol request to the Workato MCP server."""
               safe_url = re.sub(r'wkt_token=[^&]+', 'wkt_token=***', MCP_URL)
-              print(f'\nCalling Workato MCP...')
-              print(f'  URL   : {safe_url}')
-              print(f'  Files : {[f["filename"] for f in files]}')
+              headers  = {
+                  'Content-Type': 'application/json',
+                  'Accept':       'application/json',
+              }
+              body = {
+                  'jsonrpc': '2.0',
+                  'id':      1,
+                  'method':  method,
+              }
+              if params:
+                  body['params'] = params
 
-              payload = {
+              print(f'  MCP request  : {method}')
+              print(f'  URL          : {safe_url}')
+
+              resp = requests.post(
+                  MCP_URL,
+                  json=body,
+                  headers=headers,
+                  timeout=300
+              )
+              print(f'  HTTP status  : {resp.status_code}')
+
+              if resp.status_code == 401:
+                  raise SystemExit(
+                      'FATAL: 401 Unauthorized — check wkt_token in MCP_URL secret.'
+                  )
+              if resp.status_code not in (200, 202):
+                  print(f'  Response: {resp.text[:500]}')
+                  raise SystemExit(f'FATAL: MCP returned HTTP {resp.status_code}')
+
+              try:
+                  return resp.json()
+              except json.JSONDecodeError:
+                  print(f'  Raw response: {resp.text[:1000]}')
+                  raise SystemExit('FATAL: MCP returned invalid JSON.')
+
+          def get_tool_name():
+              """
+              Step 1 — Ask the MCP server to list its tools.
+              This tells us the exact tool name of your Genie skill.
+              """
+              print('\n--- Step 1: Discovering MCP tools ---')
+              try:
+                  result = mcp_request('tools/list')
+                  tools  = result.get('result', {}).get('tools', [])
+                  print(f'  Tools found: {len(tools)}')
+                  for t in tools:
+                      print(f'    - name        : {t.get("name")}')
+                      print(f'      description : {t.get("description","")[:80]}')
+
+                  if not tools:
+                      raise SystemExit(
+                          'FATAL: No tools found in MCP server. '
+                          'Make sure your Genie skill recipe is active and published in Workato.'
+                      )
+                  # Use the first (and only) tool
+                  tool_name = tools[0].get('name')
+                  print(f'\n  Using tool: {tool_name}')
+                  return tool_name, tools[0]
+
+              except SystemExit:
+                  raise
+              except Exception as e:
+                  # Some MCP servers need initialize first — try that
+                  print(f'  tools/list failed ({e}), trying initialize first...')
+                  mcp_request('initialize', {
+                      'protocolVersion': '2024-11-05',
+                      'capabilities':    {},
+                      'clientInfo':      {'name': 'github-actions', 'version': '1.0'},
+                  })
+                  result = mcp_request('tools/list')
+                  tools  = result.get('result', {}).get('tools', [])
+                  if not tools:
+                      raise SystemExit('FATAL: No tools found even after initialize.')
+                  tool_name = tools[0].get('name')
+                  print(f'  Using tool: {tool_name}')
+                  return tool_name, tools[0]
+
+          def call_mcp(jar_name, files):
+              """
+              Step 2 — Call the Genie skill tool with the XML files.
+              The MCP tools/call protocol wraps our payload inside 'arguments'.
+              """
+              # First discover the tool name
+              tool_name, tool_schema = get_tool_name()
+
+              safe_url = re.sub(r'wkt_token=[^&]+', 'wkt_token=***', MCP_URL)
+              print(f'\n--- Step 2: Calling tool "{tool_name}" ---')
+              print(f'  Files: {[f["filename"] for f in files]}')
+
+              # Build the arguments — this is what your Genie skill receives
+              arguments = {
                   'jar_name': jar_name,
                   'files': [
                       {
@@ -148,51 +235,60 @@ jobs:
                   ]
               }
 
-              # Only Content-Type header needed — token is in the URL
-              headers = {
-                  'Content-Type': 'application/json',
-                  'Accept':       'application/json',
-              }
+              result = mcp_request('tools/call', {
+                  'name':      tool_name,
+                  'arguments': arguments,
+              })
 
-              try:
-                  resp = requests.post(
-                      MCP_URL,        # full URL with wkt_token= already in it
-                      json=payload,
-                      headers=headers,
-                      timeout=300     # 5 min — LLM calls inside Workato can be slow
+              print(f'\n  Raw MCP result keys: {list(result.keys())}')
+
+              # MCP tools/call response structure:
+              # { "result": { "content": [ { "type": "text", "text": "..." } ] } }
+              mcp_result = result.get('result', {})
+              error      = result.get('error')
+
+              if error:
+                  print(f'  MCP error: {error}')
+                  raise SystemExit(f'FATAL: MCP tool returned an error: {error}')
+
+              # Extract content from MCP response
+              content_blocks = mcp_result.get('content', [])
+              print(f'  Content blocks returned: {len(content_blocks)}')
+
+              if not content_blocks:
+                  # Fallback — maybe the skill returns data directly
+                  print(f'  Full result: {json.dumps(mcp_result, indent=2)[:1000]}')
+                  raise SystemExit(
+                      'FATAL: MCP tool returned no content blocks. '
+                      'Check your Genie skill recipe is returning a response correctly.'
                   )
-                  print(f'  HTTP status : {resp.status_code}')
 
-                  if resp.status_code == 401:
-                      raise SystemExit(
-                          'FATAL: MCP returned 401 Unauthorized. '
-                          'Check that the wkt_token value in MCP_URL secret is correct '
-                          'and the Workato recipe is active.'
-                      )
-                  if resp.status_code == 404:
-                      raise SystemExit(
-                          'FATAL: MCP returned 404 Not Found. '
-                          'Check MCP_URL is correct and the Workato recipe is running.'
-                      )
-                  if resp.status_code != 200:
-                      print(f'  Response body: {resp.text[:500]}')
-                      raise SystemExit(f'FATAL: MCP returned unexpected status {resp.status_code}')
+              # Combine all text blocks into one string
+              full_text = '\n'.join(
+                  block.get('text', '')
+                  for block in content_blocks
+                  if block.get('type') == 'text'
+              )
 
-                  data = resp.json()
-                  print(f'  MCP status  : {data.get("status")}')
+              print(f'  Total text returned: {len(full_text)} chars')
+              print(f'  Preview: {full_text[:200]}...')
+
+              # The Genie skill should return our standard JSON:
+              # { "status": "success", "documents": [{filename, content}, ...] }
+              # Try to parse it as JSON first
+              try:
+                  data = json.loads(full_text)
                   docs = data.get('documents', [])
-                  print(f'  Documents returned: {len(docs)}')
-                  for d in docs:
-                      print(f'    - {d.get("filename")} ({len(d.get("content",""))} chars)')
-                  return docs
+                  if docs:
+                      print(f'  Documents parsed: {len(docs)}')
+                      return docs
+              except (json.JSONDecodeError, AttributeError):
+                  pass
 
-              except requests.exceptions.Timeout:
-                  raise SystemExit('FATAL: MCP request timed out after 5 minutes.')
-              except requests.exceptions.ConnectionError as e:
-                  raise SystemExit(f'FATAL: Could not connect to MCP URL: {e}')
-              except json.JSONDecodeError:
-                  print(f'  Raw response: {resp.text[:1000]}')
-                  raise SystemExit('FATAL: MCP returned invalid JSON.')
+              # If not JSON — treat the whole response as documentation
+              # for a single combined document
+              print('  Response is plain text — wrapping as single document.')
+              return [{'filename': jar_name, 'content': full_text}]
 
           # Call MCP with all files
           documents = call_mcp(JAR_NAME, xml_files)
@@ -554,9 +650,3 @@ jobs:
             git push origin HEAD:master
             echo "Pushed to master."
           fi
-
-
-
-
-
-          
