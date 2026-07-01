@@ -211,84 +211,147 @@ jobs:
                   print(f'  Using tool: {tool_name}')
                   return tool_name, tools[0]
 
-          def call_mcp(jar_name, files):
-              """
-              Step 2 — Call the Genie skill tool with the XML files.
-              The MCP tools/call protocol wraps our payload inside 'arguments'.
-              """
-              # First discover the tool name
-              tool_name, tool_schema = get_tool_name()
+          # Load documentation prompt from file (written by a separate workflow step)
+          DOC_PROMPT = open('/tmp/doc_prompt.txt').read()
 
-              safe_url = re.sub(r'wkt_token=[^&]+', 'wkt_token=***', MCP_URL)
-              print(f'\n--- Step 2: Calling tool "{tool_name}" ---')
-              print(f'  Files: {[f["filename"] for f in files]}')
-
-              # Build the arguments — this is what your Genie skill receives
-              arguments = {
-                  'jar_name': jar_name,
-                  'files': [
-                      {
-                          'filename': f['filename'],
-                          'content':  f['content'][:80000]
-                      }
-                      for f in files
-                  ]
-              }
-
-              result = mcp_request('tools/call', {
-                  'name':      tool_name,
-                  'arguments': arguments,
-              })
-
-              print(f'\n  Raw MCP result keys: {list(result.keys())}')
-
-              # MCP tools/call response structure:
-              # { "result": { "content": [ { "type": "text", "text": "..." } ] } }
+          def extract_text_from_mcp_result(result):
+              """Extract text content from MCP tools/call response."""
               mcp_result = result.get('result', {})
               error      = result.get('error')
 
+              print(f'  Raw result keys : {list(result.keys())}')
+
               if error:
-                  print(f'  MCP error: {error}')
+                  print(f'  MCP error: {json.dumps(error)[:300]}')
                   raise SystemExit(f'FATAL: MCP tool returned an error: {error}')
 
-              # Extract content from MCP response
+              # Standard MCP: result.content = [{type, text}, ...]
               content_blocks = mcp_result.get('content', [])
-              print(f'  Content blocks returned: {len(content_blocks)}')
+              if content_blocks:
+                  text = '\n'.join(
+                      b.get('text','') for b in content_blocks
+                      if b.get('type') == 'text'
+                  ).strip()
+                  if text:
+                      return text
 
-              if not content_blocks:
-                  # Fallback — maybe the skill returns data directly
-                  print(f'  Full result: {json.dumps(mcp_result, indent=2)[:1000]}')
+              # Workato sometimes returns result directly as string
+              if isinstance(mcp_result, str) and mcp_result.strip():
+                  return mcp_result.strip()
+
+              # Or nested under output/response/text keys
+              for key in ('output','response','text','result','message','data'):
+                  val = mcp_result.get(key)
+                  if isinstance(val, str) and val.strip():
+                      return val.strip()
+                  if isinstance(val, dict):
+                      for subkey in ('text','content','output','message'):
+                          sv = val.get(subkey)
+                          if isinstance(sv, str) and sv.strip():
+                              return sv.strip()
+
+              print(f'  Full result (debug): {json.dumps(result, indent=2)[:2000]}')
+              return None
+
+          def call_mcp(jar_name, files):
+              """
+              Calls the Genie skill ONE FILE AT A TIME to avoid truncation.
+              Each call sends:
+                - filename: the XML filename
+                - content:  the XML content (chunked if needed)
+                - prompt:   the documentation instruction
+              Collects all responses and returns as document list.
+              """
+              tool_name, tool_schema = get_tool_name()
+
+              # Filter out empty files and non-flow files
+              SKIP_FILES = {'application-types.xml', 'pom.xml'}
+              flow_files = [
+                  f for f in files
+                  if f['filename'] not in SKIP_FILES
+                  and len(f['content'].strip()) > 100
+              ]
+              print(f'\n--- Step 2: Calling tool "{tool_name}" for {len(flow_files)} file(s) ---')
+
+              all_docs = []
+
+              for idx, file in enumerate(flow_files, 1):
+                  fname   = file['filename']
+                  fcontent = file['content']
+
+                  print(f'\n  [{idx}/{len(flow_files)}] Processing: {fname} ({len(fcontent)} bytes)')
+
+                  # Chunk large files — send max 15000 chars per call
+                  # to stay well within Workato MCP input limits
+                  CHUNK_SIZE = 15000
+                  chunks     = []
+                  if len(fcontent) <= CHUNK_SIZE:
+                      chunks = [fcontent]
+                  else:
+                      # Split on flow boundaries to keep flows intact
+                      import re as _re
+                      flow_splits = _re.split(r'(?=<mule:flow |<flow )', fcontent)
+                      current     = ''
+                      for part in flow_splits:
+                          if len(current) + len(part) <= CHUNK_SIZE:
+                              current += part
+                          else:
+                              if current:
+                                  chunks.append(current)
+                              current = part
+                      if current:
+                          chunks.append(current)
+
+                  file_docs = []
+                  for ci, chunk in enumerate(chunks, 1):
+                      if len(chunks) > 1:
+                          print(f'    Chunk {ci}/{len(chunks)} ({len(chunk)} chars)...')
+
+                      # This is exactly what Workato Genie receives:
+                      # parameters.filename, parameters.content, parameters.prompt
+                      arguments = {
+                          'filename': fname,
+                          'content':  chunk,
+                          'prompt':   DOC_PROMPT,
+                      }
+
+                      try:
+                          result = mcp_request('tools/call', {
+                              'name':      tool_name,
+                              'arguments': arguments,
+                          })
+                          text = extract_text_from_mcp_result(result)
+                          if text:
+                              print(f'    Got {len(text)} chars of documentation')
+                              file_docs.append(text)
+                          else:
+                              print(f'    WARNING: No text returned for chunk {ci}')
+                      except SystemExit:
+                          raise
+                      except Exception as e:
+                          print(f'    ERROR on chunk {ci}: {e}')
+
+                      time.sleep(2)  # small delay between calls
+
+                  if file_docs:
+                      combined = '\n\n'.join(file_docs)
+                      all_docs.append({'filename': fname, 'content': combined})
+                      print(f'  Done: {fname} — {len(combined)} chars total')
+                  else:
+                      print(f'  WARNING: No documentation generated for {fname}')
+
+              if not all_docs:
                   raise SystemExit(
-                      'FATAL: MCP tool returned no content blocks. '
-                      'Check your Genie skill recipe is returning a response correctly.'
+                      'FATAL: No documentation was generated for any file.\n'
+                      'Check your Workato Genie skill recipe:\n'
+                      '  1. Is the recipe active and running?\n'
+                      '  2. Does it read the "content" and "prompt" parameters?\n'
+                      '  3. Does it call an LLM with the prompt + content?\n'
+                      '  4. Does it return the LLM response as text output?'
                   )
 
-              # Combine all text blocks into one string
-              full_text = '\n'.join(
-                  block.get('text', '')
-                  for block in content_blocks
-                  if block.get('type') == 'text'
-              )
-
-              print(f'  Total text returned: {len(full_text)} chars')
-              print(f'  Preview: {full_text[:200]}...')
-
-              # The Genie skill should return our standard JSON:
-              # { "status": "success", "documents": [{filename, content}, ...] }
-              # Try to parse it as JSON first
-              try:
-                  data = json.loads(full_text)
-                  docs = data.get('documents', [])
-                  if docs:
-                      print(f'  Documents parsed: {len(docs)}')
-                      return docs
-              except (json.JSONDecodeError, AttributeError):
-                  pass
-
-              # If not JSON — treat the whole response as documentation
-              # for a single combined document
-              print('  Response is plain text — wrapping as single document.')
-              return [{'filename': jar_name, 'content': full_text}]
+              print(f'\nTotal documents generated: {len(all_docs)}')
+              return all_docs
 
           # Call MCP with all files
           documents = call_mcp(JAR_NAME, xml_files)
@@ -621,6 +684,143 @@ jobs:
           doc.save(DOC_NAME)
           print(f'\nSaved: {DOC_NAME}')
           SCRIPTEOF
+
+      - name: Write documentation prompt
+        run: |
+          cat > /tmp/doc_prompt.txt << 'PROMPTEOF'
+          You are a MuleSoft integration expert and technical writer.
+          Document ALL flows and sub-flows in the MuleSoft XML content provided.
+
+          For each flow write exactly this structure:
+
+          ## Flow: <exact flow name>
+
+          ### Overview
+          3 to 5 sentences in plain English explaining what this flow does,
+          what triggers it, what business problem it solves, and what the result is.
+
+          ### Flow Diagram
+          A valid Mermaid graph TD diagram showing every step in order.
+          graph TD
+              A[Component: detail] --> B[Component: detail]
+          Use {} for Choice Router decisions. Show all branches. Show error handlers.
+
+          ### Trigger
+          - Type: HTTP Listener / Scheduler / File Listener / JMS / VM / None
+          - Path: <path if HTTP>
+          - Method: <GET/POST/ANY if HTTP>
+          - Schedule: <frequency and time unit if Scheduler>
+          - Directory: <directory if File Listener>
+          - Config Ref: <config-ref value>
+
+          ### Inputs
+          - <payload shape, query params, headers, variables expected>
+
+          ### Logic Steps
+
+          **Step 1: <Component Name>**
+          Description: 3 to 5 sentences explaining exactly what this step does in plain English.
+          For HTTP Request state the exact URL method and what data is sent and received.
+          For DB operations state the table name what columns are used and what the SQL does.
+          For DataWeave describe what the input looks like and what the output looks like.
+          For Choice Router describe each condition and what path is taken.
+          DataWeave:
+          BACKTICK_FENCE
+          <complete verbatim DataWeave script - never truncate or summarize>
+          BACKTICK_FENCE
+
+          **Step 2: <Component Name>**
+          Description: ...
+          (repeat for every component - never skip any)
+
+          ### Connectors Used
+          | Connector | Operation | Config Ref | Notes |
+          |-----------|-----------|------------|-------|
+          <one row per unique connector>
+
+          ### Error Handling
+          - Strategy: <on-error-propagate / on-error-continue / None>
+          - Error Types: <types caught>
+          - Behaviour: <what happens on error in plain English>
+
+          ### Outputs
+          - Payload: <final payload shape and content>
+          - Variables Set: <list of variable names set>
+
+          ### Flow References
+          <list sub-flows called via flow-ref or None>
+
+          ### Configuration Properties
+          <list dollar-sign property references or None>
+
+          ---
+
+          RULES:
+          1. Document EVERY flow and sub-flow - never skip any.
+          2. DataWeave scripts must be 100 percent complete and verbatim.
+          3. Every step must have a Description.
+          4. Write plain English a non-developer can understand.
+          5. The Mermaid diagram must show the actual flow structure.
+          6. If the file has no flows write: No flows defined in this file.
+          PROMPTEOF
+          # Replace placeholder with actual backtick fence
+          sed -i 's/BACKTICK_FENCE/```/g' /tmp/doc_prompt.txt
+
+      - name: Write documentation prompt
+        run: |
+          cat > /tmp/doc_prompt.txt << 'PROMPTEOF'
+          You are a MuleSoft integration expert and technical writer.
+          Document ALL flows and sub-flows in the MuleSoft XML content provided.
+          For each flow write exactly this structure:
+          ## Flow: <exact flow name>
+          ### Overview
+          3 to 5 sentences in plain English explaining what this flow does,
+          what triggers it, what business problem it solves, and what the result is.
+          ### Flow Diagram
+          A valid Mermaid graph TD diagram showing every step in order.
+          graph TD
+              A[Component: detail] --> B[Component: detail]
+          Use {} for Choice Router decisions. Show all branches. Show error handlers.
+          ### Trigger
+          - Type: HTTP Listener / Scheduler / File Listener / JMS / VM / None
+          - Path: <path if HTTP>
+          - Method: <GET/POST/ANY if HTTP>
+          - Schedule: <frequency and time unit if Scheduler>
+          - Directory: <directory if File Listener>
+          - Config Ref: <config-ref value>
+          ### Inputs
+          - <payload shape, query params, headers, variables expected>
+          ### Logic Steps
+          **Step 1: <Component Name>**
+          Description: 3 to 5 sentences explaining exactly what this step does.
+          For HTTP Request state the exact URL method and what data is sent and received.
+          For DB operations state the table name columns used and what the SQL does.
+          For DataWeave describe what the input looks like and what the output looks like.
+          For Choice Router describe each condition and what path is taken.
+          DataWeave: <paste complete verbatim DataWeave script here if present>
+          **Step 2: <Component Name>**
+          Description: ...
+          Repeat for every component - never skip any.
+          ### Connectors Used
+          | Connector | Operation | Config Ref | Notes |
+          |-----------|-----------|------------|-------|
+          <one row per unique connector>
+          ### Error Handling
+          - Strategy: <on-error-propagate / on-error-continue / None>
+          - Error Types: <types caught>
+          - Behaviour: <what happens on error in plain English>
+          ### Outputs
+          - Payload: <final payload shape and content>
+          - Variables Set: <list of variable names set>
+          ### Flow References
+          <list sub-flows called via flow-ref or None>
+          ### Configuration Properties
+          <list property references used or None>
+          ---
+          RULES: Document EVERY flow. DataWeave scripts must be complete and verbatim.
+          Every step must have a Description. Write plain English.
+          If the file has no flows write: No flows defined in this file.
+          PROMPTEOF
 
       - name: Run documentation generator
         env:
