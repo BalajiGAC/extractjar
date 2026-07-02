@@ -281,38 +281,51 @@ jobs:
 
                   print(f'\n  [{idx}/{len(flow_files)}] Processing: {fname} ({len(fcontent)} bytes)')
 
-                  # Chunk large files — send max 15000 chars per call
-                  # to stay well within Workato MCP input limits
-                  CHUNK_SIZE = 15000
-                  chunks     = []
-                  if len(fcontent) <= CHUNK_SIZE:
+                  # Workato MCP truncates inputs — split each file
+                  # into individual flows and send ONE FLOW PER CALL
+                  # This guarantees no truncation regardless of file size
+                  CHUNK_SIZE  = 4000
+                  chunks      = []
+
+                  # Try to split on individual <flow> elements
+                  flow_blocks = re.findall(
+                      r'(<(?:mule:)?flow[^>]*>.*?</(?:mule:)?flow>)',
+                      fcontent, re.DOTALL
+                  )
+                  subflow_blocks = re.findall(
+                      r'(<(?:mule:)?sub-flow[^>]*>.*?</(?:mule:)?sub-flow>)',
+                      fcontent, re.DOTALL
+                  )
+                  all_flows = flow_blocks + subflow_blocks
+
+                  if all_flows:
+                      # Extract just the mule root open tag + namespaces as context header
+                      header_match = re.match(r'(<mule[^>]*>)', fcontent, re.DOTALL)
+                      header = header_match.group(1) if header_match else '<mule>'
+                      for flow_block in all_flows:
+                          # Wrap each flow in mule tags so it's valid XML context
+                          chunk = f'{header}\n{flow_block}\n</mule>'
+                          chunks.append(chunk)
+                  elif len(fcontent) <= CHUNK_SIZE:
                       chunks = [fcontent]
                   else:
-                      # Split on flow boundaries to keep flows intact
-                      import re as _re
-                      flow_splits = _re.split(r'(?=<mule:flow |<flow )', fcontent)
-                      current     = ''
-                      for part in flow_splits:
-                          if len(current) + len(part) <= CHUNK_SIZE:
-                              current += part
-                          else:
-                              if current:
-                                  chunks.append(current)
-                              current = part
-                      if current:
-                          chunks.append(current)
+                      # Fallback: split by character limit
+                      for i in range(0, len(fcontent), CHUNK_SIZE):
+                          chunks.append(fcontent[i:i+CHUNK_SIZE])
 
                   file_docs = []
                   for ci, chunk in enumerate(chunks, 1):
                       if len(chunks) > 1:
                           print(f'    Chunk {ci}/{len(chunks)} ({len(chunk)} chars)...')
 
-                      # This is exactly what Workato Genie receives:
-                      # parameters.filename, parameters.content, parameters.prompt
+                      # Workato Genie receives parameters.content and parameters.filename
+                      # The Genie uses its built-in skill description as the prompt
+                      # We also pass an explicit instruction in case the skill reads it
                       arguments = {
-                          'filename': fname,
-                          'content':  chunk,
-                          'prompt':   DOC_PROMPT,
+                          'filename':    fname,
+                          'content':     chunk,
+                          'instruction': DOC_PROMPT,
+                          'message':     f'Document the MuleSoft flow in the provided XML content from file {fname}. {DOC_PROMPT}',
                       }
 
                       try:
