@@ -318,14 +318,11 @@ jobs:
                       if len(chunks) > 1:
                           print(f'    Chunk {ci}/{len(chunks)} ({len(chunk)} chars)...')
 
-                      # Workato Genie receives parameters.content and parameters.filename
-                      # The Genie uses its built-in skill description as the prompt
-                      # We also pass an explicit instruction in case the skill reads it
+                      # Workato Genie expects parameter named 'xml'
+                      # (error: missing property 'xml' confirms this)
                       arguments = {
-                          'filename':    fname,
-                          'content':     chunk,
-                          'instruction': DOC_PROMPT,
-                          'message':     f'Document the MuleSoft flow in the provided XML content from file {fname}. {DOC_PROMPT}',
+                          'xml':      chunk,
+                          'filename': fname,
                       }
 
                       try:
