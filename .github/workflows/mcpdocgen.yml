@@ -98,13 +98,17 @@ jobs:
           for root, dirs, files in os.walk(EXTRACT_DIR):
               for f in sorted(files):
                   if f.lower().endswith('.xml') and f not in seen:
-                      full = os.path.join(root, f)
-                      content = read_file(full)
+                      full        = os.path.join(root, f)
+                      file_content = read_file(full)
                       # Only include files that look like MuleSoft flows
-                      if 'mulesoft.org/schema/mule' in content or '<mule' in content:
+                      if 'mulesoft.org/schema/mule' in file_content or '<mule' in file_content:
                           seen.add(f)
-                          xml_files.append({'filename': f, 'content': content})
-                          print(f'  [INCLUDE] {full} ({len(content)} bytes)')
+                          xml_files.append({
+                              'filename': f,
+                              'filepath': full,          # actual path on disk for file upload
+                              'content':  file_content,  # text content for size checks
+                          })
+                          print(f'  [INCLUDE] {full} ({len(file_content)} bytes)')
                       else:
                           print(f'  [skip]    {full}')
 
