@@ -1,4 +1,4 @@
-name: MuleSoft JAR Documentation Generator (OpenAI API)
+name: MuleSoft JAR Documentation Generator (Gemini API)
 
 on:
   workflow_dispatch:
@@ -39,50 +39,48 @@ jobs:
           echo "JAR_NAME=$JAR_NAME" >> $GITHUB_ENV
 
       - name: Install dependencies
-        run: pip install python-docx openai
+        run: pip install python-docx google-genai
 
       - name: Write Python script
         run: |
           cat > /tmp/generate_docs.py << 'SCRIPTEOF'
-          import os, re, time, xml.etree.ElementTree as ET
+          import os, re, time, tempfile, xml.etree.ElementTree as ET
           from datetime import date
-          import openai
+          from google import genai
+          from google.genai import types
+          from google.genai import errors as genai_errors
           from docx import Document
           from docx.shared import Pt, RGBColor, Inches
           from docx.enum.text import WD_ALIGN_PARAGRAPH
           from docx.oxml.ns import qn
           from docx.oxml import OxmlElement
 
-          EXTRACT_DIR = os.environ.get('EXTRACT_DIR', 'extracted')
-          JAR_NAME    = os.environ.get('JAR_NAME', 'unknown.jar')
-          TODAY       = date.today().isoformat()
-          GITHUB_REF  = os.environ.get('GITHUB_REF_NAME', 'N/A')
-          GITHUB_SHA  = os.environ.get('GITHUB_SHA', 'N/A')[:8]
-          DOC_NAME    = JAR_NAME.replace('.jar', '') + '-flow-documentation.docx'
-          OPENAI_MODEL = os.environ.get('OPENAI_MODEL', 'gpt-4o')
+          EXTRACT_DIR  = os.environ.get('EXTRACT_DIR', 'extracted')
+          JAR_NAME     = os.environ.get('JAR_NAME', 'unknown.jar')
+          TODAY        = date.today().isoformat()
+          GITHUB_REF   = os.environ.get('GITHUB_REF_NAME', 'N/A')
+          GITHUB_SHA   = os.environ.get('GITHUB_SHA', 'N/A')[:8]
+          DOC_NAME     = JAR_NAME.replace('.jar', '') + '-flow-documentation.docx'
+          GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-3.5-flash')
+
           # ── Safe API key diagnostic — never prints the actual key ──
-          _raw_key = os.environ.get('OPENAI_API_KEY', '')
+          _raw_key = os.environ.get('GEMINI_API_KEY', '')
           _key     = _raw_key.strip()
           print('=' * 70)
           print('API KEY DIAGNOSTIC')
           print(f'  key present          : {bool(_key)}')
           print(f'  key length           : {len(_key)}')
           print(f'  key had whitespace   : {_raw_key != _key}')
-          print(f'  starts with sk-      : {_key.startswith("sk-")}')
-          print(f'  first 10 chars       : {_key[:10] if _key else "(empty)"}...')
+          print(f'  first 6 chars        : {_key[:6] if _key else "(empty)"}...')
           print('=' * 70)
           if not _key:
               raise SystemExit(
-                  'FATAL: OPENAI_API_KEY is empty. Check that the secret is set '
+                  'FATAL: GEMINI_API_KEY is empty. Check that the secret is set '
                   'as a Repository secret (not Environment secret unless this job '
                   'declares environment:), and that the workflow step passes it via env:.'
               )
-          if not _key.startswith('sk-'):
-              print('WARNING: key does not start with expected "sk-" prefix. '
-                    'Double check you copied the full key from platform.openai.com '
-                    'with no truncation or extra characters.')
 
-          client       = openai.OpenAI(api_key=_key)
+          client       = genai.Client(api_key=_key)
           MULE_CORE_NS = 'http://www.mulesoft.org/schema/mule/core'
 
           def read_xml(path):
@@ -109,8 +107,6 @@ jobs:
               print(f'!!! EXTRACT_DIR does not exist: {EXTRACT_DIR}')
 
           # ── Collect every .xml file anywhere under EXTRACT_DIR ──
-          # No filtering, no namespace checks, no skipped directories.
-          # Every single .xml file found will be sent to ChatGPT.
           xml_files = []
           seen_filenames = set()
 
@@ -119,7 +115,6 @@ jobs:
                   for f in sorted(files):
                       if f.lower().endswith('.xml'):
                           full = os.path.join(root, f)
-                          # De-dupe by filename, keep first occurrence
                           if f not in seen_filenames:
                               seen_filenames.add(f)
                               xml_files.append((f, full))
@@ -131,39 +126,58 @@ jobs:
               print(f'  {fpath}  ({size} bytes)')
           print('=' * 70)
 
-          SYSTEM_PROMPT = open('/tmp/openai_prompt.txt').read()
+          SYSTEM_PROMPT = open('/tmp/gemini_prompt.txt').read()
 
-          def call_chatgpt(filename, xml_content):
-              print(f'  Calling ChatGPT for: {filename} ({len(xml_content)} chars)...')
-              if len(xml_content) > 90000:
-                  xml_content = xml_content[:90000] + '\n<!-- TRUNCATED -->'
+          def call_gemini(filename, xml_path):
+              """
+              Uploads the XML file itself via the Gemini Files API instead of
+              pasting its content inline as text. This removes the old ~90k
+              character inline truncation limit — the file is sent whole and
+              Gemini reads it directly.
+              """
+              size = os.path.getsize(xml_path)
+              print(f'  Uploading to Gemini Files API: {filename} ({size} bytes)...')
+              uploaded = None
               try:
-                  msg = client.chat.completions.create(
-                      model=OPENAI_MODEL,
-                      max_tokens=8000,
-                      messages=[
-                          {'role': 'system', 'content': SYSTEM_PROMPT},
-                          {
-                              'role': 'user',
-                              'content': f'Document ALL flows in this MuleSoft XML file named `{filename}`.\n\n{xml_content}'
-                          }
-                      ]
+                  uploaded = client.files.upload(
+                      file=xml_path,
+                      config=dict(mime_type='text/xml'),
                   )
-                  return msg.choices[0].message.content.strip()
-              except openai.AuthenticationError as e:
+
+                  prompt_text = f'Document ALL flows in this MuleSoft XML file named `{filename}`.'
+
+                  print(f'  Calling {GEMINI_MODEL} for: {filename}...')
+                  response = client.models.generate_content(
+                      model=GEMINI_MODEL,
+                      contents=[uploaded, prompt_text],
+                      config=types.GenerateContentConfig(
+                          system_instruction=SYSTEM_PROMPT,
+                          max_output_tokens=8000,
+                      ),
+                  )
+                  return (response.text or '').strip()
+
+              except genai_errors.ClientError as e:
                   print('=' * 70)
-                  print(f'  AUTHENTICATION ERROR for {filename}: {e}')
-                  print('  This means the API key was rejected by OpenAI.')
-                  print('  Most likely causes:')
+                  print(f'  CLIENT/AUTH ERROR for {filename}: {e}')
+                  print('  This usually means the API key was rejected by Gemini, or')
+                  print('  the request was otherwise invalid. Most likely causes:')
                   print('    1. Secret value has a typo, truncation, or extra whitespace')
                   print('    2. Secret is an Environment secret but job has no environment: set')
-                  print('    3. Key was revoked/rotated in platform.openai.com')
+                  print('    3. Key was revoked/rotated in Google AI Studio')
                   print('    4. Wrong secret name referenced in workflow env: block')
                   print('=' * 70)
                   raise SystemExit(1)
               except Exception as e:
                   print(f'  API error for {filename}: {e}')
                   return None
+              finally:
+                  # Clean up the uploaded file on Gemini's side once we're done with it.
+                  if uploaded is not None:
+                      try:
+                          client.files.delete(name=uploaded.name)
+                      except Exception as cleanup_err:
+                          print(f'  (non-fatal) could not delete uploaded file: {cleanup_err}')
 
           def parse_flow_blocks(response_text):
               blocks = []
@@ -187,16 +201,12 @@ jobs:
           ]
 
           def get_section(raw, section_name):
-              # Match ##SECTION_NAME## marker style
               marker = f'##{section_name}##'
               if marker not in raw:
-                  # fallback: plain header style
                   pattern = rf'{re.escape(section_name)}\s*\n(.*?)(?=\n(?:{"|".join(re.escape(s) for s in SECTION_NAMES)})\s*\n|##|$)'
                   match = re.search(pattern, raw, re.DOTALL)
                   return match.group(1).strip() if match else ''
-              # Split on ## markers
               after  = raw.split(marker, 1)[1]
-              # End at next ## marker or end of string
               end    = re.search(r'##[A-Z]', after)
               result = after[:end.start()].strip() if end else after.strip()
               return result
@@ -441,20 +451,17 @@ jobs:
               ftype = block['type']
               raw   = block['raw']
 
-              # Flow heading
               doc.add_heading(f'Flow: {name}', level=2)
               add_kv(doc, 'Source File', filename)
               add_kv(doc, 'Flow Type', ftype)
               doc.add_paragraph()
 
-              # Overview
               overview = get_section(raw, 'OVERVIEW')
               if overview:
                   doc.add_heading('Overview', level=3)
                   p = doc.add_paragraph(overview)
                   p.paragraph_format.space_after = Pt(6)
 
-              # Flow Diagram
               diagram = get_section(raw, 'FLOW DIAGRAM')
               if diagram and diagram.strip():
                   doc.add_heading('Flow Diagram', level=3)
@@ -469,7 +476,6 @@ jobs:
                       diagram_clean = 'graph TD\n' + diagram_clean
                   add_code_block(doc, diagram_clean, indent=0.2)
 
-              # Trigger
               trigger = get_section(raw, 'TRIGGER')
               if trigger:
                   doc.add_heading('Trigger', level=3)
@@ -484,7 +490,6 @@ jobs:
                               add_kv(doc, k.strip(), v, indent=True)
                   doc.add_paragraph()
 
-              # Inputs
               inputs = get_section(raw, 'INPUTS')
               if inputs:
                   doc.add_heading('Inputs', level=3)
@@ -494,7 +499,6 @@ jobs:
                           add_bullet(doc, line)
                   doc.add_paragraph()
 
-              # Logic Steps — inline DataWeave
               logic = get_section(raw, 'LOGIC STEPS')
               doc.add_heading('Logic Steps', level=3)
               intro = doc.add_paragraph()
@@ -509,7 +513,6 @@ jobs:
                   doc.add_paragraph('').add_run('No logic steps found.').italic = True
               doc.add_paragraph()
 
-              # Connectors & Components
               connectors = get_section(raw, 'CONNECTORS USED')
               doc.add_heading('Connectors & Components Used', level=3)
               if connectors and '|' in connectors:
@@ -523,7 +526,6 @@ jobs:
                   doc.add_paragraph('').add_run('None').italic = True
               doc.add_paragraph()
 
-              # Error Handling
               error = get_section(raw, 'ERROR HANDLING')
               doc.add_heading('Error Handling', level=3)
               if error and error.strip().lower() not in ('none',''):
@@ -542,7 +544,6 @@ jobs:
                   add_bullet(doc, 'Behaviour: Errors propagate to the default Mule error handler')
               doc.add_paragraph()
 
-              # Outputs
               outputs = get_section(raw, 'OUTPUTS')
               if outputs:
                   doc.add_heading('Outputs', level=3)
@@ -558,7 +559,6 @@ jobs:
                           add_bullet(doc, line)
                   doc.add_paragraph()
 
-              # Flow References
               refs = get_section(raw, 'FLOW REFERENCES')
               doc.add_heading('Flow References', level=3)
               if refs and refs.strip().lower() not in ('none',''):
@@ -569,7 +569,6 @@ jobs:
               else:
                   doc.add_paragraph('').add_run('None').italic = True
 
-              # Config Properties
               props = get_section(raw, 'CONFIGURATION PROPERTIES')
               doc.add_heading('Configuration Properties Used', level=3)
               if props and props.strip().lower() not in ('none',''):
@@ -585,11 +584,10 @@ jobs:
 
           all_results = []
           for fname, fpath in xml_files:
-              xml_content = read_xml(fpath)
-              if not xml_content:
-                  print(f'  Skipping empty: {fname}')
+              if not os.path.exists(fpath) or os.path.getsize(fpath) == 0:
+                  print(f'  Skipping empty/missing: {fname}')
                   continue
-              response = call_chatgpt(fname, xml_content)
+              response = call_gemini(fname, fpath)
               if response:
                   blocks = parse_flow_blocks(response)
                   print(f'  Parsed {len(blocks)} flow(s) from {fname}')
@@ -621,7 +619,7 @@ jobs:
           doc.add_paragraph()
           np = doc.add_paragraph()
           np.alignment = WD_ALIGN_PARAGRAPH.CENTER
-          nr = np.add_run(f'Generated by OpenAI ChatGPT ({OPENAI_MODEL})')
+          nr = np.add_run(f'Generated by Google Gemini ({GEMINI_MODEL})')
           nr.font.size = Pt(10)
           nr.font.color.rgb = GREY
           doc.add_page_break()
@@ -638,7 +636,7 @@ jobs:
               f'Each flow section contains: overview, Mermaid flow diagram, trigger, '
               f'inputs, logic steps with inline DataWeave scripts, connectors used, '
               f'error handling, outputs, flow references, and configuration properties. '
-              f'Documentation generated by OpenAI ChatGPT.'
+              f'Documentation generated by Google Gemini.'
           )
           p.paragraph_format.space_after = Pt(8)
           add_divider(doc)
@@ -662,11 +660,11 @@ jobs:
           print(f'Saved: {DOC_NAME}')
           SCRIPTEOF
 
-      - name: Write OpenAI prompt file
+      - name: Write Gemini prompt file
         run: |
-          cat > /tmp/openai_prompt.txt << 'PROMPTEOF'
+          cat > /tmp/gemini_prompt.txt << 'PROMPTEOF'
           You are a senior MuleSoft integration architect and technical writer.
-          You will receive the raw XML content of a MuleSoft Mule 4 flow file.
+          You will receive a MuleSoft Mule 4 flow file as an attached XML document.
           Your task is to produce thorough, accurate, human-readable documentation for EVERY <mule:flow> and <mule:sub-flow> found in the XML.
 
           IMPORTANT: Read the XML carefully. Extract real values - real flow names, real paths, real DataWeave scripts, real connector names. Do not make up or guess anything.
@@ -806,8 +804,8 @@ jobs:
 
       - name: Run documentation generator
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: gpt-4o
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: gemini-3.5-flash
           EXTRACT_DIR: ${{ env.EXTRACT_DIR }}
           JAR_NAME: ${{ env.JAR_NAME }}
         run: python3 /tmp/generate_docs.py
@@ -817,24 +815,19 @@ jobs:
           JAR_BASE="${{ github.event.inputs.jar_file }}"
           DOC_NAME="${JAR_BASE%.jar}-flow-documentation.docx"
 
-          # Set git identity
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Set remote URL with PAT so push is always authenticated
           git remote set-url origin https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/${{ github.repository }}.git
 
-          # Pull latest master to stay in sync
           git pull origin master --rebase
 
-          # Stage only the doc file — skip binary cache files
           git add "$DOC_NAME" || true
 
-          # Commit only if there are staged changes
           if git diff --cached --quiet; then
             echo "No changes to commit — documentation is already up to date."
           else
-            git commit -m "docs: ChatGPT-generated flow documentation for ${{ github.event.inputs.jar_file }}"
+            git commit -m "docs: Gemini-generated flow documentation for ${{ github.event.inputs.jar_file }}"
             git push origin HEAD:master
             echo "Successfully pushed to master"
           fi
