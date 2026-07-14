@@ -1,4 +1,4 @@
-name: MuleSoft JAR Documentation Generator (Claude API)
+name: MuleSoft JAR Documentation Generator (Gemini API)
 
 on:
   workflow_dispatch:
@@ -39,50 +39,65 @@ jobs:
           echo "JAR_NAME=$JAR_NAME" >> $GITHUB_ENV
 
       - name: Install dependencies
-        run: pip install python-docx anthropic
+        run: pip install python-docx google-genai
 
       - name: Write Python script
         run: |
           cat > /tmp/generate_docs.py << 'SCRIPTEOF'
-          import os, re, time, xml.etree.ElementTree as ET
+          import os, re, time, tempfile, xml.etree.ElementTree as ET
           from datetime import date
-          import anthropic
+          from google import genai
+          from google.genai import types
+          from google.genai import errors as genai_errors
           from docx import Document
           from docx.shared import Pt, RGBColor, Inches
           from docx.enum.text import WD_ALIGN_PARAGRAPH
           from docx.oxml.ns import qn
           from docx.oxml import OxmlElement
 
-          EXTRACT_DIR = os.environ.get('EXTRACT_DIR', 'extracted')
-          JAR_NAME    = os.environ.get('JAR_NAME', 'unknown.jar')
-          TODAY       = date.today().isoformat()
-          GITHUB_REF  = os.environ.get('GITHUB_REF_NAME', 'N/A')
-          GITHUB_SHA  = os.environ.get('GITHUB_SHA', 'N/A')[:8]
-          DOC_NAME    = JAR_NAME.replace('.jar', '') + '-flow-documentation.docx'
+          EXTRACT_DIR  = os.environ.get('EXTRACT_DIR', 'extracted')
+          JAR_NAME     = os.environ.get('JAR_NAME', 'unknown.jar')
+          TODAY        = date.today().isoformat()
+          GITHUB_REF   = os.environ.get('GITHUB_REF_NAME', 'N/A')
+          GITHUB_SHA   = os.environ.get('GITHUB_SHA', 'N/A')[:8]
+          DOC_NAME     = JAR_NAME.replace('.jar', '') + '-flow-documentation.docx'
+          GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-3.5-flash')
+
           # ── Safe API key diagnostic — never prints the actual key ──
-          _raw_key = os.environ.get('ANTHROPIC_API_KEY', '')
+          _raw_key = os.environ.get('GEMINI_API_KEY', '')
           _key     = _raw_key.strip()
           print('=' * 70)
           print('API KEY DIAGNOSTIC')
           print(f'  key present          : {bool(_key)}')
           print(f'  key length           : {len(_key)}')
           print(f'  key had whitespace   : {_raw_key != _key}')
-          print(f'  starts with sk-ant-  : {_key.startswith("sk-ant-")}')
-          print(f'  first 10 chars       : {_key[:10] if _key else "(empty)"}...')
+          print(f'  first 6 chars        : {_key[:6] if _key else "(empty)"}...')
           print('=' * 70)
           if not _key:
               raise SystemExit(
-                  'FATAL: ANTHROPIC_API_KEY is empty. Check that the secret is set '
+                  'FATAL: GEMINI_API_KEY is empty. Check that the secret is set '
                   'as a Repository secret (not Environment secret unless this job '
                   'declares environment:), and that the workflow step passes it via env:.'
               )
-          if not _key.startswith('sk-ant-'):
-              print('WARNING: key does not start with expected "sk-ant-" prefix. '
-                    'Double check you copied the full key from console.anthropic.com '
-                    'with no truncation or extra characters.')
 
-          client       = anthropic.Anthropic(api_key=_key)
+          client       = genai.Client(api_key=_key)
           MULE_CORE_NS = 'http://www.mulesoft.org/schema/mule/core'
+
+          # ── Token usage + timing accumulators (populated across all API calls) ──
+          PROCESS_START_TIME  = time.time()
+          TOTAL_INPUT_TOKENS  = 0
+          TOTAL_OUTPUT_TOKENS = 0
+          TOTAL_TOKENS        = 0
+
+          def format_duration(seconds):
+              seconds = int(round(seconds))
+              hours, rem = divmod(seconds, 3600)
+              minutes, secs = divmod(rem, 60)
+              if hours:
+                  return f'{hours}h {minutes}m {secs}s'
+              if minutes:
+                  return f'{minutes}m {secs}s'
+              return f'{secs}s'
 
           def read_xml(path):
               try:
@@ -108,8 +123,6 @@ jobs:
               print(f'!!! EXTRACT_DIR does not exist: {EXTRACT_DIR}')
 
           # ── Collect every .xml file anywhere under EXTRACT_DIR ──
-          # No filtering, no namespace checks, no skipped directories.
-          # Every single .xml file found will be sent to Claude.
           xml_files = []
           seen_filenames = set()
 
@@ -118,7 +131,6 @@ jobs:
                   for f in sorted(files):
                       if f.lower().endswith('.xml'):
                           full = os.path.join(root, f)
-                          # De-dupe by filename, keep first occurrence
                           if f not in seen_filenames:
                               seen_filenames.add(f)
                               xml_files.append((f, full))
@@ -130,37 +142,72 @@ jobs:
               print(f'  {fpath}  ({size} bytes)')
           print('=' * 70)
 
-          SYSTEM_PROMPT = open('/tmp/claude_prompt.txt').read()
+          SYSTEM_PROMPT = open('/tmp/gemini_prompt.txt').read()
 
-          def call_claude(filename, xml_content):
-              print(f'  Calling Claude for: {filename} ({len(xml_content)} chars)...')
-              if len(xml_content) > 90000:
-                  xml_content = xml_content[:90000] + '\n<!-- TRUNCATED -->'
+          def call_gemini(filename, xml_path):
+              """
+              Uploads the XML file itself via the Gemini Files API instead of
+              pasting its content inline as text. This removes the old ~90k
+              character inline truncation limit — the file is sent whole and
+              Gemini reads it directly.
+              """
+              size = os.path.getsize(xml_path)
+              print(f'  Uploading to Gemini Files API: {filename} ({size} bytes)...')
+              uploaded = None
               try:
-                  msg = client.messages.create(
-                      model='claude-sonnet-4-6',
-                      max_tokens=8000,
-                      system=SYSTEM_PROMPT,
-                      messages=[{
-                          'role': 'user',
-                          'content': f'Document ALL flows in this MuleSoft XML file named `{filename}`.\n\n{xml_content}'
-                      }]
+                  uploaded = client.files.upload(
+                      file=xml_path,
+                      config=dict(mime_type='text/xml'),
                   )
-                  return msg.content[0].text.strip()
-              except anthropic.AuthenticationError as e:
+
+                  prompt_text = f'Document ALL flows in this MuleSoft XML file named `{filename}`.'
+
+                  print(f'  Calling {GEMINI_MODEL} for: {filename}...')
+                  response = client.models.generate_content(
+                      model=GEMINI_MODEL,
+                      contents=[uploaded, prompt_text],
+                      config=types.GenerateContentConfig(
+                          system_instruction=SYSTEM_PROMPT,
+                          max_output_tokens=8000,
+                      ),
+                  )
+
+                  global TOTAL_INPUT_TOKENS, TOTAL_OUTPUT_TOKENS, TOTAL_TOKENS
+                  usage = getattr(response, 'usage_metadata', None)
+                  if usage:
+                      in_tok  = usage.prompt_token_count or 0
+                      out_tok = usage.candidates_token_count or 0
+                      tot_tok = usage.total_token_count or (in_tok + out_tok)
+                      TOTAL_INPUT_TOKENS  += in_tok
+                      TOTAL_OUTPUT_TOKENS += out_tok
+                      TOTAL_TOKENS        += tot_tok
+                      print(f'  Tokens for {filename} - input: {in_tok}, output: {out_tok}, total: {tot_tok}')
+                  else:
+                      print(f'  (usage_metadata not available for {filename})')
+
+                  return (response.text or '').strip()
+
+              except genai_errors.ClientError as e:
                   print('=' * 70)
-                  print(f'  AUTHENTICATION ERROR for {filename}: {e}')
-                  print('  This means the API key was rejected by Anthropic.')
-                  print('  Most likely causes:')
+                  print(f'  CLIENT/AUTH ERROR for {filename}: {e}')
+                  print('  This usually means the API key was rejected by Gemini, or')
+                  print('  the request was otherwise invalid. Most likely causes:')
                   print('    1. Secret value has a typo, truncation, or extra whitespace')
                   print('    2. Secret is an Environment secret but job has no environment: set')
-                  print('    3. Key was revoked/rotated in console.anthropic.com')
+                  print('    3. Key was revoked/rotated in Google AI Studio')
                   print('    4. Wrong secret name referenced in workflow env: block')
                   print('=' * 70)
                   raise SystemExit(1)
               except Exception as e:
                   print(f'  API error for {filename}: {e}')
                   return None
+              finally:
+                  # Clean up the uploaded file on Gemini's side once we're done with it.
+                  if uploaded is not None:
+                      try:
+                          client.files.delete(name=uploaded.name)
+                      except Exception as cleanup_err:
+                          print(f'  (non-fatal) could not delete uploaded file: {cleanup_err}')
 
           def parse_flow_blocks(response_text):
               blocks = []
@@ -184,16 +231,12 @@ jobs:
           ]
 
           def get_section(raw, section_name):
-              # Match ##SECTION_NAME## marker style
               marker = f'##{section_name}##'
               if marker not in raw:
-                  # fallback: plain header style
                   pattern = rf'{re.escape(section_name)}\s*\n(.*?)(?=\n(?:{"|".join(re.escape(s) for s in SECTION_NAMES)})\s*\n|##|$)'
                   match = re.search(pattern, raw, re.DOTALL)
                   return match.group(1).strip() if match else ''
-              # Split on ## markers
               after  = raw.split(marker, 1)[1]
-              # End at next ## marker or end of string
               end    = re.search(r'##[A-Z]', after)
               result = after[:end.start()].strip() if end else after.strip()
               return result
@@ -438,35 +481,24 @@ jobs:
               ftype = block['type']
               raw   = block['raw']
 
-              # Flow heading
               doc.add_heading(f'Flow: {name}', level=2)
               add_kv(doc, 'Source File', filename)
               add_kv(doc, 'Flow Type', ftype)
               doc.add_paragraph()
 
-              # Overview
               overview = get_section(raw, 'OVERVIEW')
               if overview:
                   doc.add_heading('Overview', level=3)
                   p = doc.add_paragraph(overview)
                   p.paragraph_format.space_after = Pt(6)
 
-              # Flow Diagram
               diagram = get_section(raw, 'FLOW DIAGRAM')
               if diagram and diagram.strip():
                   doc.add_heading('Flow Diagram', level=3)
-                  note_p = doc.add_paragraph()
-                  note_r = note_p.add_run('Mermaid diagram - paste into https://mermaid.live to render visually')
-                  note_r.italic = True
-                  note_r.font.size = Pt(9)
-                  note_r.font.color.rgb = GREY
                   diagram_clean = re.sub(r'^```[a-z]*\n?', '', diagram.strip())
                   diagram_clean = re.sub(r'\n?```$', '', diagram_clean).strip()
-                  if not diagram_clean.startswith('graph'):
-                      diagram_clean = 'graph TD\n' + diagram_clean
                   add_code_block(doc, diagram_clean, indent=0.2)
 
-              # Trigger
               trigger = get_section(raw, 'TRIGGER')
               if trigger:
                   doc.add_heading('Trigger', level=3)
@@ -481,7 +513,6 @@ jobs:
                               add_kv(doc, k.strip(), v, indent=True)
                   doc.add_paragraph()
 
-              # Inputs
               inputs = get_section(raw, 'INPUTS')
               if inputs:
                   doc.add_heading('Inputs', level=3)
@@ -491,7 +522,6 @@ jobs:
                           add_bullet(doc, line)
                   doc.add_paragraph()
 
-              # Logic Steps — inline DataWeave
               logic = get_section(raw, 'LOGIC STEPS')
               doc.add_heading('Logic Steps', level=3)
               intro = doc.add_paragraph()
@@ -506,7 +536,6 @@ jobs:
                   doc.add_paragraph('').add_run('No logic steps found.').italic = True
               doc.add_paragraph()
 
-              # Connectors & Components
               connectors = get_section(raw, 'CONNECTORS USED')
               doc.add_heading('Connectors & Components Used', level=3)
               if connectors and '|' in connectors:
@@ -520,7 +549,6 @@ jobs:
                   doc.add_paragraph('').add_run('None').italic = True
               doc.add_paragraph()
 
-              # Error Handling
               error = get_section(raw, 'ERROR HANDLING')
               doc.add_heading('Error Handling', level=3)
               if error and error.strip().lower() not in ('none',''):
@@ -539,7 +567,6 @@ jobs:
                   add_bullet(doc, 'Behaviour: Errors propagate to the default Mule error handler')
               doc.add_paragraph()
 
-              # Outputs
               outputs = get_section(raw, 'OUTPUTS')
               if outputs:
                   doc.add_heading('Outputs', level=3)
@@ -555,7 +582,6 @@ jobs:
                           add_bullet(doc, line)
                   doc.add_paragraph()
 
-              # Flow References
               refs = get_section(raw, 'FLOW REFERENCES')
               doc.add_heading('Flow References', level=3)
               if refs and refs.strip().lower() not in ('none',''):
@@ -566,7 +592,6 @@ jobs:
               else:
                   doc.add_paragraph('').add_run('None').italic = True
 
-              # Config Properties
               props = get_section(raw, 'CONFIGURATION PROPERTIES')
               doc.add_heading('Configuration Properties Used', level=3)
               if props and props.strip().lower() not in ('none',''):
@@ -582,11 +607,10 @@ jobs:
 
           all_results = []
           for fname, fpath in xml_files:
-              xml_content = read_xml(fpath)
-              if not xml_content:
-                  print(f'  Skipping empty: {fname}')
+              if not os.path.exists(fpath) or os.path.getsize(fpath) == 0:
+                  print(f'  Skipping empty/missing: {fname}')
                   continue
-              response = call_claude(fname, xml_content)
+              response = call_gemini(fname, fpath)
               if response:
                   blocks = parse_flow_blocks(response)
                   print(f'  Parsed {len(blocks)} flow(s) from {fname}')
@@ -618,7 +642,7 @@ jobs:
           doc.add_paragraph()
           np = doc.add_paragraph()
           np.alignment = WD_ALIGN_PARAGRAPH.CENTER
-          nr = np.add_run('Generated by Claude AI (claude-sonnet-4-6)')
+          nr = np.add_run(f'Generated by Google Gemini ({GEMINI_MODEL})')
           nr.font.size = Pt(10)
           nr.font.color.rgb = GREY
           doc.add_page_break()
@@ -635,7 +659,7 @@ jobs:
               f'Each flow section contains: overview, Mermaid flow diagram, trigger, '
               f'inputs, logic steps with inline DataWeave scripts, connectors used, '
               f'error handling, outputs, flow references, and configuration properties. '
-              f'Documentation generated by Claude AI.'
+              f'Documentation generated by Google Gemini.'
           )
           p.paragraph_format.space_after = Pt(8)
           add_divider(doc)
@@ -655,15 +679,36 @@ jobs:
                   for block in blocks:
                       render_flow(doc, block, fname)
                       doc.add_page_break()
+
+          # ── Processing Summary: token usage + total time taken ──
+          total_elapsed = time.time() - PROCESS_START_TIME
+          doc.add_heading('Processing Summary', level=1)
+          add_kv(doc, 'Total Input Tokens', f'{TOTAL_INPUT_TOKENS:,}')
+          add_kv(doc, 'Total Output Tokens', f'{TOTAL_OUTPUT_TOKENS:,}')
+          add_kv(doc, 'Total Tokens (Input + Output)', f'{TOTAL_TOKENS:,}')
+          add_kv(doc, 'Total Time Taken', format_duration(total_elapsed))
+          doc.add_paragraph()
+          note = doc.add_paragraph()
+          note_r = note.add_run(
+              'Token counts are reported by the Gemini API per file (usage_metadata) and '
+              'summed across all XML files processed. Total time covers file uploads, '
+              'model calls, and document generation for this run.'
+          )
+          note_r.italic = True
+          note_r.font.size = Pt(9)
+          note_r.font.color.rgb = GREY
+
           doc.save(DOC_NAME)
           print(f'Saved: {DOC_NAME}')
+          print(f'Total tokens - input: {TOTAL_INPUT_TOKENS}, output: {TOTAL_OUTPUT_TOKENS}, total: {TOTAL_TOKENS}')
+          print(f'Total time taken: {format_duration(total_elapsed)}')
           SCRIPTEOF
 
-      - name: Write Claude prompt file
+      - name: Write Gemini prompt file
         run: |
-          cat > /tmp/claude_prompt.txt << 'PROMPTEOF'
+          cat > /tmp/gemini_prompt.txt << 'PROMPTEOF'
           You are a senior MuleSoft integration architect and technical writer.
-          You will receive the raw XML content of a MuleSoft Mule 4 flow file.
+          You will receive a MuleSoft Mule 4 flow file as an attached XML document.
           Your task is to produce thorough, accurate, human-readable documentation for EVERY <mule:flow> and <mule:sub-flow> found in the XML.
 
           IMPORTANT: Read the XML carefully. Extract real values - real flow names, real paths, real DataWeave scripts, real connector names. Do not make up or guess anything.
@@ -684,20 +729,15 @@ jobs:
           A business analyst with no technical background should be able to read this and understand the flow.
 
           ##FLOW DIAGRAM##
-          Write a Mermaid graph TD diagram showing the EXACT steps in this flow in order.
-          Start with: graph TD
+          Write a plain-text, indentation-based flow diagram showing the EXACT sequence of components in this flow, in the order they execute. Do NOT use Mermaid or any diagramming syntax - plain text only, no code fences.
           Rules:
-          - Every component in the XML must appear as a node
-          - Use A[label] for normal steps
-          - Use A{label} for Choice Router or decision points  
-          - Use A([label]) for merge or end points
-          - Use --> for connections
-          - Use -->|condition text| for conditional branches
-          - For Scatter-Gather show each route as a separate branch that merges at the end
-          - For Choice show each when/otherwise as a separate branch
-          - For Try show inner steps with an error branch going to the error handler
-          - Node labels must be short: ComponentType: key-detail (max 50 chars)
-          - Use only letters numbers and basic punctuation in node labels - no quotes or special chars
+          - Number each step in the main sequence like [1], [2], [3] and connect consecutive steps with a line containing only an arrow: -->
+          - Format each step as: [N] ComponentType: key-detail  (e.g. [1] HTTP Listener: /api/orders)
+          - Every single component in the XML must appear, in the same order as ##LOGIC STEPS##.
+          - For a Choice Router: after its step line, indent one level and list each branch on its own line as "WHEN <exact condition from XML>:" or "OTHERWISE:", then indent again and list that branch's steps using the same [N] ComponentType: key-detail format connected with -->. After all branches, show a line "--> [merge] Continue after Choice" at the original indentation level.
+          - For a Scatter-Gather: after its step line, indent one level and list each route as "ROUTE 1:", "ROUTE 2:", etc, then indent again and list that route's steps. After all routes, show "--> [merge] Continue after Scatter-Gather" at the original indentation level.
+          - For a Try Scope: after its step line, indent one level, list "TRY:" with its inner steps indented under it, then list "ON ERROR:" with the error-handling steps indented under it.
+          - Use 2 spaces per indentation level. Keep each line under 80 characters.
           Do NOT show a generic example - show the ACTUAL flow from the XML.
 
           ##TRIGGER##
@@ -788,7 +828,8 @@ jobs:
           <List every flow-ref name attribute found in this flow. Write None if there are none.>
 
           ##CONFIGURATION PROPERTIES##
-          <List every ${property.name} placeholder found anywhere in this flow XML. Write None if there are none.>
+          - Property Files Referenced: <If this XML file contains a <configuration-properties>, <secure-property-placeholder:config>, or similar global element that loads an external property file, list the exact file attribute value(s) referenced verbatim (e.g. config-${env}.properties). Write None if no property file is referenced.>
+          - Properties Used: <List EVERY ${property.name} placeholder found anywhere in this flow's XML, one per line, in the format: property.name = <the literal value if it is visible directly in this XML (e.g. a default value syntax like ${property.name:default}), otherwise write (value defined in external property file)>. Write None if there are none.>
           @@FLOW_END@@
 
           ===== CRITICAL RULES =====
@@ -803,7 +844,8 @@ jobs:
 
       - name: Run documentation generator
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: gemini-3.5-flash
           EXTRACT_DIR: ${{ env.EXTRACT_DIR }}
           JAR_NAME: ${{ env.JAR_NAME }}
         run: python3 /tmp/generate_docs.py
@@ -813,24 +855,19 @@ jobs:
           JAR_BASE="${{ github.event.inputs.jar_file }}"
           DOC_NAME="${JAR_BASE%.jar}-flow-documentation.docx"
 
-          # Set git identity
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Set remote URL with PAT so push is always authenticated
           git remote set-url origin https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/${{ github.repository }}.git
 
-          # Pull latest master to stay in sync
           git pull origin master --rebase
 
-          # Stage only the doc file — skip binary cache files
           git add "$DOC_NAME" || true
 
-          # Commit only if there are staged changes
           if git diff --cached --quiet; then
             echo "No changes to commit — documentation is already up to date."
           else
-            git commit -m "docs: Claude-generated flow documentation for ${{ github.event.inputs.jar_file }}"
+            git commit -m "docs: Gemini-generated flow documentation for ${{ github.event.inputs.jar_file }}"
             git push origin HEAD:master
             echo "Successfully pushed to master"
           fi
