@@ -83,6 +83,22 @@ jobs:
           client       = genai.Client(api_key=_key)
           MULE_CORE_NS = 'http://www.mulesoft.org/schema/mule/core'
 
+          # ── Token usage + timing accumulators (populated across all API calls) ──
+          PROCESS_START_TIME  = time.time()
+          TOTAL_INPUT_TOKENS  = 0
+          TOTAL_OUTPUT_TOKENS = 0
+          TOTAL_TOKENS        = 0
+
+          def format_duration(seconds):
+              seconds = int(round(seconds))
+              hours, rem = divmod(seconds, 3600)
+              minutes, secs = divmod(rem, 60)
+              if hours:
+                  return f'{hours}h {minutes}m {secs}s'
+              if minutes:
+                  return f'{minutes}m {secs}s'
+              return f'{secs}s'
+
           def read_xml(path):
               try:
                   with open(path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -155,6 +171,20 @@ jobs:
                           max_output_tokens=8000,
                       ),
                   )
+
+                  global TOTAL_INPUT_TOKENS, TOTAL_OUTPUT_TOKENS, TOTAL_TOKENS
+                  usage = getattr(response, 'usage_metadata', None)
+                  if usage:
+                      in_tok  = usage.prompt_token_count or 0
+                      out_tok = usage.candidates_token_count or 0
+                      tot_tok = usage.total_token_count or (in_tok + out_tok)
+                      TOTAL_INPUT_TOKENS  += in_tok
+                      TOTAL_OUTPUT_TOKENS += out_tok
+                      TOTAL_TOKENS        += tot_tok
+                      print(f'  Tokens for {filename} - input: {in_tok}, output: {out_tok}, total: {tot_tok}')
+                  else:
+                      print(f'  (usage_metadata not available for {filename})')
+
                   return (response.text or '').strip()
 
               except genai_errors.ClientError as e:
@@ -465,15 +495,8 @@ jobs:
               diagram = get_section(raw, 'FLOW DIAGRAM')
               if diagram and diagram.strip():
                   doc.add_heading('Flow Diagram', level=3)
-                  note_p = doc.add_paragraph()
-                  note_r = note_p.add_run('Mermaid diagram - paste into https://mermaid.live to render visually')
-                  note_r.italic = True
-                  note_r.font.size = Pt(9)
-                  note_r.font.color.rgb = GREY
                   diagram_clean = re.sub(r'^```[a-z]*\n?', '', diagram.strip())
                   diagram_clean = re.sub(r'\n?```$', '', diagram_clean).strip()
-                  if not diagram_clean.startswith('graph'):
-                      diagram_clean = 'graph TD\n' + diagram_clean
                   add_code_block(doc, diagram_clean, indent=0.2)
 
               trigger = get_section(raw, 'TRIGGER')
@@ -656,8 +679,29 @@ jobs:
                   for block in blocks:
                       render_flow(doc, block, fname)
                       doc.add_page_break()
+
+          # ── Processing Summary: token usage + total time taken ──
+          total_elapsed = time.time() - PROCESS_START_TIME
+          doc.add_heading('Processing Summary', level=1)
+          add_kv(doc, 'Total Input Tokens', f'{TOTAL_INPUT_TOKENS:,}')
+          add_kv(doc, 'Total Output Tokens', f'{TOTAL_OUTPUT_TOKENS:,}')
+          add_kv(doc, 'Total Tokens (Input + Output)', f'{TOTAL_TOKENS:,}')
+          add_kv(doc, 'Total Time Taken', format_duration(total_elapsed))
+          doc.add_paragraph()
+          note = doc.add_paragraph()
+          note_r = note.add_run(
+              'Token counts are reported by the Gemini API per file (usage_metadata) and '
+              'summed across all XML files processed. Total time covers file uploads, '
+              'model calls, and document generation for this run.'
+          )
+          note_r.italic = True
+          note_r.font.size = Pt(9)
+          note_r.font.color.rgb = GREY
+
           doc.save(DOC_NAME)
           print(f'Saved: {DOC_NAME}')
+          print(f'Total tokens - input: {TOTAL_INPUT_TOKENS}, output: {TOTAL_OUTPUT_TOKENS}, total: {TOTAL_TOKENS}')
+          print(f'Total time taken: {format_duration(total_elapsed)}')
           SCRIPTEOF
 
       - name: Write Gemini prompt file
@@ -685,20 +729,15 @@ jobs:
           A business analyst with no technical background should be able to read this and understand the flow.
 
           ##FLOW DIAGRAM##
-          Write a Mermaid graph TD diagram showing the EXACT steps in this flow in order.
-          Start with: graph TD
+          Write a plain-text, indentation-based flow diagram showing the EXACT sequence of components in this flow, in the order they execute. Do NOT use Mermaid or any diagramming syntax - plain text only, no code fences.
           Rules:
-          - Every component in the XML must appear as a node
-          - Use A[label] for normal steps
-          - Use A{label} for Choice Router or decision points  
-          - Use A([label]) for merge or end points
-          - Use --> for connections
-          - Use -->|condition text| for conditional branches
-          - For Scatter-Gather show each route as a separate branch that merges at the end
-          - For Choice show each when/otherwise as a separate branch
-          - For Try show inner steps with an error branch going to the error handler
-          - Node labels must be short: ComponentType: key-detail (max 50 chars)
-          - Use only letters numbers and basic punctuation in node labels - no quotes or special chars
+          - Number each step in the main sequence like [1], [2], [3] and connect consecutive steps with a line containing only an arrow: -->
+          - Format each step as: [N] ComponentType: key-detail  (e.g. [1] HTTP Listener: /api/orders)
+          - Every single component in the XML must appear, in the same order as ##LOGIC STEPS##.
+          - For a Choice Router: after its step line, indent one level and list each branch on its own line as "WHEN <exact condition from XML>:" or "OTHERWISE:", then indent again and list that branch's steps using the same [N] ComponentType: key-detail format connected with -->. After all branches, show a line "--> [merge] Continue after Choice" at the original indentation level.
+          - For a Scatter-Gather: after its step line, indent one level and list each route as "ROUTE 1:", "ROUTE 2:", etc, then indent again and list that route's steps. After all routes, show "--> [merge] Continue after Scatter-Gather" at the original indentation level.
+          - For a Try Scope: after its step line, indent one level, list "TRY:" with its inner steps indented under it, then list "ON ERROR:" with the error-handling steps indented under it.
+          - Use 2 spaces per indentation level. Keep each line under 80 characters.
           Do NOT show a generic example - show the ACTUAL flow from the XML.
 
           ##TRIGGER##
@@ -789,7 +828,8 @@ jobs:
           <List every flow-ref name attribute found in this flow. Write None if there are none.>
 
           ##CONFIGURATION PROPERTIES##
-          <List every ${property.name} placeholder found anywhere in this flow XML. Write None if there are none.>
+          - Property Files Referenced: <If this XML file contains a <configuration-properties>, <secure-property-placeholder:config>, or similar global element that loads an external property file, list the exact file attribute value(s) referenced verbatim (e.g. config-${env}.properties). Write None if no property file is referenced.>
+          - Properties Used: <List EVERY ${property.name} placeholder found anywhere in this flow's XML, one per line, in the format: property.name = <the literal value if it is visible directly in this XML (e.g. a default value syntax like ${property.name:default}), otherwise write (value defined in external property file)>. Write None if there are none.>
           @@FLOW_END@@
 
           ===== CRITICAL RULES =====
